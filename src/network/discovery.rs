@@ -2,7 +2,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
@@ -79,7 +79,6 @@ impl DiscoveryMessage {
 pub struct DiscoveredPeer {
     pub name: String,
     pub addr: SocketAddr,
-    pub last_seen: Instant,
 }
 
 /// Peer discovery service
@@ -192,20 +191,6 @@ impl Discovery {
         Ok(())
     }
 
-    /// Receive a discovery message
-    pub async fn recv(&self) -> Result<(DiscoveryMessage, SocketAddr), super::NetworkError> {
-        let mut buf = [0u8; 256];
-        let (len, addr) = self
-            .socket
-            .recv_from(&mut buf)
-            .await
-            .map_err(|e| super::NetworkError::Recv(format!("Discovery recv failed: {}", e)))?;
-
-        DiscoveryMessage::from_bytes(&buf[..len])
-            .ok_or(super::NetworkError::InvalidMessage)
-            .map(|msg| (msg, addr))
-    }
-
     /// Get the socket for use in select!
     pub fn socket(&self) -> Arc<UdpSocket> {
         Arc::clone(&self.socket)
@@ -251,6 +236,11 @@ pub async fn run_discovery(
             result = socket.recv_from(&mut buf) => {
                 match result {
                     Ok((len, addr)) => {
+                        if len == 0 {
+                            // Prevent busy loop on 0-byte packets
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            continue;
+                        }
                         if let Some(msg) = DiscoveryMessage::from_bytes(&buf[..len]) {
                             match msg {
                                 DiscoveryMessage::Announce { name, port } => {
@@ -261,7 +251,6 @@ pub async fn run_discovery(
                                         let peer = DiscoveredPeer {
                                             name,
                                             addr: peer_addr,
-                                            last_seen: Instant::now(),
                                         };
                                         let _ = peer_tx.send(peer).await;
                                     }
@@ -275,13 +264,14 @@ pub async fn run_discovery(
                     }
                     Err(e) => {
                         eprintln!("Discovery recv error: {}", e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
             }
 
             // Shutdown signal
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
                     break;
                 }
             }

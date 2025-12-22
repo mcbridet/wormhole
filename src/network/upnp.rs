@@ -61,21 +61,6 @@ pub fn setup_port_forward(
     }
 }
 
-/// Remove a UPnP port mapping
-pub fn remove_port_forward(external_port: u16) -> Result<(), super::NetworkError> {
-    let gateway = igd_next::search_gateway(igd_next::SearchOptions {
-        timeout: Some(Duration::from_secs(5)),
-        ..Default::default()
-    })
-    .map_err(|e| super::NetworkError::Upnp(format!("Failed to find gateway: {}", e)))?;
-
-    gateway
-        .remove_port(igd_next::PortMappingProtocol::UDP, external_port)
-        .map_err(|e| super::NetworkError::Upnp(format!("Failed to remove port mapping: {}", e)))?;
-
-    Ok(())
-}
-
 /// Get the local IP address to use for UPnP
 fn get_local_ip() -> Result<std::net::Ipv4Addr, super::NetworkError> {
     // Create a UDP socket and "connect" to a public address

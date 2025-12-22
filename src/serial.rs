@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::config::SerialConfig;
 
 /// Default timeout for serial port operations
-const DEFAULT_TIMEOUT_MS: u64 = 100;
+const DEFAULT_TIMEOUT_MS: u64 = 10;
 
 /// A wrapper around a serial port connection with reconnection support
 pub struct Serial {
@@ -61,6 +61,15 @@ impl Serial {
         self.port = None;
     }
 
+    /// Clear the input buffer
+    pub fn clear_input(&mut self) -> Result<(), SerialError> {
+        match self.port.as_mut() {
+            Some(port) => port.clear(serialport::ClearBuffer::Input)
+                .map_err(|e| SerialError::Read(io::Error::new(io::ErrorKind::Other, e))),
+            None => Ok(()),
+        }
+    }
+
     /// Write a string to the serial port
     pub fn write_str(&mut self, s: &str) -> Result<(), SerialError> {
         let port = self.port.as_mut().ok_or(SerialError::Disconnected)?;
@@ -69,34 +78,23 @@ impl Serial {
         Ok(())
     }
 
-    /// Write formatted output to the serial port
-    pub fn write_fmt(&mut self, args: std::fmt::Arguments<'_>) -> Result<(), SerialError> {
-        let s = std::fmt::format(args);
-        self.write_str(&s)
-    }
-
     /// Read available bytes from the serial port (non-blocking style with timeout)
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, SerialError> {
         let port = self.port.as_mut().ok_or(SerialError::Disconnected)?;
+        
+        // Check if any bytes are available before blocking on read
+        // This prevents busy-looping on PTYs that return immediately
+        match port.bytes_to_read() {
+            Ok(0) => return Ok(0), // No data available, don't block
+            Ok(_) => {} // Data available, proceed to read
+            Err(_) => {} // Can't check, fall through to read with timeout
+        }
+        
         match port.read(buf) {
             Ok(n) => Ok(n),
             Err(e) if e.kind() == io::ErrorKind::TimedOut => Ok(0),
             Err(e) => Err(SerialError::Read(e)),
         }
-    }
-
-    /// Read a single byte if available
-    pub fn read_byte(&mut self) -> Result<Option<u8>, SerialError> {
-        let mut buf = [0u8; 1];
-        match self.read(&mut buf)? {
-            0 => Ok(None),
-            _ => Ok(Some(buf[0])),
-        }
-    }
-
-    /// Get mutable access to the underlying serial port
-    pub fn inner_mut(&mut self) -> Option<&mut Box<dyn SerialPort>> {
-        self.port.as_mut()
     }
     
     /// Get the port path
@@ -142,22 +140,6 @@ pub enum SerialError {
 }
 
 impl SerialError {
-    /// Check if this error indicates a disconnection
-    pub fn is_disconnect(&self) -> bool {
-        match self {
-            SerialError::Disconnected => true,
-            SerialError::Read(e) | SerialError::Write(e) => {
-                matches!(
-                    e.kind(),
-                    io::ErrorKind::BrokenPipe
-                        | io::ErrorKind::ConnectionReset
-                        | io::ErrorKind::NotConnected
-                        | io::ErrorKind::PermissionDenied
-                )
-            }
-            _ => false,
-        }
-    }
 }
 
 impl std::fmt::Display for SerialError {

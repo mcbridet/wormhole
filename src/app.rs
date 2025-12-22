@@ -4,9 +4,9 @@ use std::time::Duration;
 use std::net::SocketAddr;
 use std::io::Write;
 use tokio::sync::mpsc;
-use chrono::Local;
 
 use crate::config::Config;
+use crate::log::SessionLogger;
 use crate::serial::Serial;
 use crate::network::{self, NetworkNode, Discovery, DiscoveredPeer, Message, PeerEvent, run_discovery};
 use crate::webcam::WebcamStream;
@@ -29,10 +29,18 @@ pub struct App {
     pub gemini_chat: Option<GeminiChat>,
     pub chat_buffer: ChatBuffer,
     pub ai_buffer: ChatBuffer,
+    pub logger: Option<SessionLogger>,
     pub active_tab: Tab,
     pub active_call: Option<String>,
+    pub call_connected: bool,
+    pub call_last_packet: Option<std::time::Instant>,
     pub current_stream_frame: Option<(String, Vec<String>)>,
+    pub last_rendered_frame: Option<Vec<String>>,
     pub line_buffer: String,
+    pub input_cursor: usize,
+    pub input_history: Vec<String>,
+    pub history_index: Option<usize>,
+    pub ai_processing: bool,
     pub running: Arc<AtomicBool>,
     
     // Channels
@@ -42,7 +50,12 @@ pub struct App {
     
     // Task handles
     pub net_recv_task: tokio::task::JoinHandle<()>,
-    // We don't strictly need to keep the discovery task handle if it handles its own shutdown or we don't await it
+    pub _discovery_shutdown_tx: tokio::sync::watch::Sender<bool>,
+
+    // Stats
+    pub stats_last_check: std::time::Instant,
+    pub stats_bytes_sent: usize,
+    pub stats_frames_rendered: usize,
 }
 
 impl App {
@@ -151,7 +164,7 @@ impl App {
         let (discovery_tx, discovery_rx) = mpsc::channel::<DiscoveredPeer>(32);
 
         // Shutdown signal for discovery
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (discovery_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         // Spawn discovery task
         let discovery_clone = Arc::clone(&discovery);
@@ -174,11 +187,15 @@ impl App {
         let net_recv_task = tokio::spawn(async move {
             let mut buf = [0u8; 65535]; // Increased buffer size for stream frames
             while running_net.load(Ordering::SeqCst) {
-                // Use a short timeout to allow checking the running flag
-                tokio::select! {
-                    result = socket.recv_from(&mut buf) => {
+                // Use a timeout to allow checking the running flag periodically
+                match tokio::time::timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await {
+                    Ok(result) => {
                         match result {
                             Ok((len, _addr)) => {
+                                if len == 0 {
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                    continue;
+                                }
                                 if let Some(msg) = Message::from_bytes(&buf[..len]) {
                                     match msg {
                                         Message::Chat { .. } => {
@@ -187,11 +204,20 @@ impl App {
                                         Message::StreamFrame { .. } => {
                                             let _ = net_tx.send(msg).await;
                                         }
+                                        Message::CallRequest { .. } => {
+                                            let _ = net_tx.send(msg).await;
+                                        }
+                                        Message::CallHangup { .. } => {
+                                            let _ = net_tx.send(msg).await;
+                                        }
+                                        Message::CallReject { .. } => {
+                                            let _ = net_tx.send(msg).await;
+                                        }
                                         Message::Join { name } => {
-                                            let _ = peer_event_tx.send(PeerEvent::Joined { name }).await;
+                                            let _ = peer_event_tx.send(PeerEvent::Joined { name, addr: _addr }).await;
                                         }
                                         Message::Leave { name } => {
-                                            let _ = peer_event_tx.send(PeerEvent::Left { name }).await;
+                                            let _ = peer_event_tx.send(PeerEvent::Left { name, addr: _addr }).await;
                                         }
                                         Message::Ping { seq } => {
                                             // Respond with pong
@@ -206,20 +232,27 @@ impl App {
                             }
                             Err(e) => {
                                 eprintln!("Network receive error: {}", e);
+                                // Avoid spinning on error
+                                tokio::time::sleep(Duration::from_millis(100)).await;
                             }
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                        // Brief check for shutdown - recv_from will wake immediately on data
+                    Err(_) => {
+                        // Timeout, check running flag and continue
                     }
                 }
             }
         });
 
+        // Calculate terminal width for chat buffers and Gemini
+        let use_drcs = config.terminal.mode == "vt220";
+        let use_132_cols = config.terminal.mode == "vt220";
+        let width = if use_132_cols { 132 } else { 80 };
+
         // Initialize Gemini chat if configured
         let gemini_available = GeminiChat::is_available(&config.gemini);
         let gemini_chat = if gemini_available {
-            match GeminiChat::new(&config.gemini) {
+            match GeminiChat::new(&config.gemini, width, &config.terminal.mode) {
                 Ok(chat) => Some(chat),
                 Err(e) => {
                     eprintln!("Warning: Failed to initialize Gemini: {}", e);
@@ -234,11 +267,14 @@ impl App {
         let active_tab = Tab::Chat;
         let active_call: Option<String> = None;
 
+        // Initialize terminal (load DRCS if needed)
+        let _ = serial.write_str(&crate::terminal::get_init_sequence(use_drcs, use_132_cols));
+
         // Initialize split-screen terminal UI with tabs
-        let _ = serial.write_str(&init_split_screen_with_tabs(&config.network.name, active_tab, gemini_available, active_call.as_deref(), None));
+        let _ = serial.write_str(&init_split_screen_with_tabs(&config.network.name, active_tab, gemini_available, active_call.as_deref(), None, width));
 
         // Create chat buffers for each tab
-        let chat_buffer = ChatBuffer::new();
+        let chat_buffer = ChatBuffer::new(width);
         let webcam = match WebcamStream::new(config.webcam.device.as_deref()) {
             Ok(cam) => {
                 eprintln!("Webcam initialized successfully.");
@@ -250,13 +286,13 @@ impl App {
             }
         };
 
-        let mut ai_buffer = ChatBuffer::new();
-
-        // Add welcome message to AI buffer if available
-        if gemini_available {
-            let timestamp = Local::now().format("%I:%M%p");
-            ai_buffer.push(format!("[{}] *** Gemini AI ready. Type to chat! ***", timestamp));
-        }
+        let ai_buffer = ChatBuffer::new(width);
+        
+        // Add initial message to AI buffer if Gemini is available
+        let ai_buffer = ai_buffer;
+        
+        // Initialize session logger if configured
+        let logger = SessionLogger::new(config.logging.directory.as_deref());
 
         Ok(Self {
             config,
@@ -266,15 +302,43 @@ impl App {
             gemini_chat,
             chat_buffer,
             ai_buffer,
+            logger,
             active_tab,
             active_call,
+            call_connected: false,
+            call_last_packet: None,
             current_stream_frame: None,
+            last_rendered_frame: None,
             line_buffer: String::new(),
+            input_cursor: 0,
+            input_history: Vec::new(),
+            history_index: None,
+            ai_processing: false,
             running,
             discovery_rx,
             net_rx,
             peer_event_rx,
             net_recv_task,
+            _discovery_shutdown_tx: discovery_shutdown_tx,
+            stats_last_check: std::time::Instant::now(),
+            stats_bytes_sent: 0,
+            stats_frames_rendered: 0,
         })
+    }
+    
+    /// Push a message to the chat buffer and log it
+    pub fn push_chat(&mut self, message: String) {
+        if let Some(ref mut logger) = self.logger {
+            logger.log_chat(&message);
+        }
+        self.chat_buffer.push(message);
+    }
+    
+    /// Push a message to the AI buffer and log it
+    pub fn push_ai(&mut self, message: String) {
+        if let Some(ref mut logger) = self.logger {
+            logger.log_ai(&message);
+        }
+        self.ai_buffer.push(message);
     }
 }

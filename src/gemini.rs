@@ -1,5 +1,3 @@
-//! Google Gemini AI chat integration.
-
 use crate::config::GeminiConfig;
 use futures::TryStreamExt;
 use gemini_rust::{Gemini, Model};
@@ -49,7 +47,9 @@ pub struct GeminiChat {
 
 impl GeminiChat {
     /// Create a new Gemini chat session from config
-    pub fn new(config: &GeminiConfig) -> Result<Self, GeminiError> {
+    /// `terminal_width` is the number of columns available for output
+    /// `terminal_mode` is the terminal type (e.g., "vt100" or "vt220")
+    pub fn new(config: &GeminiConfig, terminal_width: usize, terminal_mode: &str) -> Result<Self, GeminiError> {
         let api_key = config.api_key.as_ref().ok_or(GeminiError::NoApiKey)?;
 
         // Parse model string to Model enum and create client with that model
@@ -63,9 +63,19 @@ impl GeminiChat {
         let client = Gemini::with_model(api_key, model)
             .map_err(|e| GeminiError::ClientError(e.to_string()))?;
 
+        // Build system prompt with terminal information
+        // Account for chat buffer margins (4 chars: left border + padding + right border)
+        let available_cols = terminal_width.saturating_sub(4);
+        let system_prompt = config.system_prompt.as_ref().map(|prompt| {
+            format!(
+                "{} The user is on a {} terminal with {} columns. Keep your responses under {} characters per line to avoid wrapping.",
+                prompt, terminal_mode.to_uppercase(), terminal_width, available_cols
+            )
+        });
+
         Ok(Self {
             client,
-            system_prompt: config.system_prompt.clone(),
+            system_prompt,
             history: Vec::new(),
         })
     }
@@ -139,6 +149,12 @@ impl GeminiChat {
 
     /// Clear conversation history
     pub fn clear_history(&mut self) {
+        self.history.clear();
+    }
+
+    /// Set a new system prompt (clears history as well)
+    pub fn set_system_prompt(&mut self, prompt: String) {
+        self.system_prompt = Some(prompt);
         self.history.clear();
     }
 }

@@ -1,6 +1,7 @@
-//! Webcam capture and ASCII art conversion for VT100/VT120 terminals.
+//! Webcam capture and ASCII art conversion for VT100/VT220 terminals.
 
-use image::{imageops::FilterType, DynamicImage};
+use image::{imageops::FilterType, DynamicImage, GenericImageView};
+use crate::dec_graphics::DecGraphicsChar;
 use nokhwa::{
     pixel_format::RgbFormat,
     utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution},
@@ -8,21 +9,41 @@ use nokhwa::{
 };
 
 /// ASCII characters ordered by visual density (light to dark)
+#[allow(dead_code)]
 const ASCII_RAMP: &[char] = &[' ', '.', ':', '-', '=', '+', '*', '#', '%', '@'];
 
-/// Terminal dimensions for the image (leaving room for borders)
-/// For proper aspect ratio with ~2:1 character cells:
-/// - Each character is roughly 2x tall as wide
-/// - So 16 rows = 32 "visual units" tall
-/// - We use 65 chars width for a ~2:1 aspect ratio (wider than 16:9)
-/// - We center the 65-char image in the 76-char display width
-const IMAGE_WIDTH: u32 = 65;
+/// Convert a brightness value (0-255) to an enhanced character (char, is_dec_graphics)
+fn brightness_to_enhanced_char(brightness: u8) -> (char, bool) {
+    // Don't invert for light-on-dark terminals
+    // Bright (255) -> Dense char (@) -> White pixel
+    // Dark (0) -> Space ( ) -> Black pixel
+    
+    // Enhanced ramp mixing ASCII and DEC graphics
+    // 0: Space (ASCII)
+    // 1: Bullet (DEC) - Small dot
+    // 2: . (ASCII)
+    // 3: : (ASCII)
+    // 4: + (ASCII)
+    // 5: Checkerboard (DEC) - 50%
+    // 6: # (ASCII)
+    // 7: @ (ASCII)
+    
+    match brightness {
+        0..=40 => (' ', false),
+        41..=70 => (DecGraphicsChar::Bullet.as_dec_char(), true),
+        71..=100 => ('.', false),
+        101..=130 => (':', false),
+        131..=160 => ('+', false),
+        161..=190 => (DecGraphicsChar::Checkerboard.as_dec_char(), true),
+        191..=220 => ('#', false),
+        _ => ('@', false),
+    }
+}
+
 /// Height in terminal rows
 const IMAGE_HEIGHT: u32 = 16;
 /// Height in terminal rows for Call mode
-const CALL_IMAGE_HEIGHT: u32 = 20;
-/// Display width (for centering)
-const DISPLAY_WIDTH: usize = 76;
+const CALL_IMAGE_HEIGHT: u32 = 22;
 
 /// Error type for webcam operations
 #[derive(Debug)]
@@ -49,6 +70,7 @@ impl From<nokhwa::NokhwaError> for WebcamError {
 }
 
 /// Convert a brightness value (0-255) to an ASCII character
+#[allow(dead_code)]
 fn brightness_to_char(brightness: u8) -> char {
     // Invert so bright = light characters, dark = dense characters
     let inverted = 255 - brightness;
@@ -70,7 +92,7 @@ fn parse_device_index(device: &str) -> Result<u32, WebcamError> {
 }
 
 /// Capture a single frame from the webcam and convert to ASCII art lines
-pub fn capture_ascii_snapshot(device: Option<&str>) -> Result<Vec<String>, WebcamError> {
+pub fn capture_ascii_snapshot(device: Option<&str>, use_drcs: bool, display_width: usize) -> Result<Vec<String>, WebcamError> {
     let device = device.ok_or(WebcamError::NotConfigured)?;
     
     let index = parse_device_index(device)?;
@@ -112,7 +134,7 @@ pub fn capture_ascii_snapshot(device: Option<&str>) -> Result<Vec<String>, Webca
     
     // Convert to our ASCII art
     let image = DynamicImage::ImageRgb8(decoded);
-    Ok(image_to_ascii(&image, IMAGE_HEIGHT))
+    Ok(image_to_ascii(&image, IMAGE_HEIGHT, use_drcs, display_width))
 }
 
 /// A persistent webcam stream handler
@@ -126,17 +148,25 @@ impl WebcamStream {
         let index = parse_device_index(device)?;
         let camera_index = CameraIndex::Index(index);
         
-        // First try: Preference for 640x480 MJPEG @ 30fps
-        let format = CameraFormat::new(Resolution::new(640, 480), FrameFormat::MJPEG, 30);
+        // First try: Preference for 1280x720 MJPEG @ 30fps (16:9 aspect ratio)
+        let format = CameraFormat::new(Resolution::new(1280, 720), FrameFormat::MJPEG, 30);
         let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(format));
         
         let camera = match Camera::new(camera_index.clone(), requested) {
             Ok(cam) => cam,
             Err(e) => {
                 eprintln!("Preferred format failed ({}), trying fallback...", e);
-                // Fallback: Try with no specific format requirements (let the driver pick)
-                let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
-                Camera::new(camera_index, requested)?
+                // Fallback: Try 640x480
+                let format = CameraFormat::new(Resolution::new(640, 480), FrameFormat::MJPEG, 30);
+                let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(format));
+                match Camera::new(camera_index.clone(), requested) {
+                    Ok(cam) => cam,
+                    Err(_) => {
+                        // Final fallback
+                        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
+                        Camera::new(camera_index, requested)?
+                    }
+                }
             }
         };
         
@@ -175,11 +205,11 @@ impl WebcamStream {
         }
     }
 
-    pub fn capture_frame(&mut self) -> Result<Vec<String>, WebcamError> {
+    pub fn capture_frame(&mut self, use_drcs: bool, display_width: usize) -> Result<Vec<String>, WebcamError> {
         let frame = self.camera.frame()?;
         let decoded = frame.decode_image::<RgbFormat>()?;
         let image = DynamicImage::ImageRgb8(decoded);
-        Ok(image_to_ascii(&image, CALL_IMAGE_HEIGHT))
+        Ok(image_to_ascii(&image, CALL_IMAGE_HEIGHT, use_drcs, display_width))
     }
 }
 
@@ -213,9 +243,15 @@ fn enhance_contrast(image: &image::GrayImage) -> image::GrayImage {
         }
     }
     
-    // Avoid division by zero
+    // Avoid division by zero and extreme stretching of noise
     if max_val <= min_val {
         max_val = min_val + 1;
+    }
+    
+    // Prevent over-stretching of dark images (noise amplification)
+    // If the dynamic range is small and mostly dark, don't stretch it to full white
+    if max_val < 100 {
+        max_val = 100;
     }
     
     let range = (max_val - min_val) as f32;
@@ -239,11 +275,34 @@ fn enhance_contrast(image: &image::GrayImage) -> image::GrayImage {
 }
 
 /// Convert an image to ASCII art lines
-fn image_to_ascii(image: &DynamicImage, height_rows: u32) -> Vec<String> {
+fn image_to_ascii(image: &DynamicImage, height_rows: u32, use_drcs: bool, display_width: usize) -> Vec<String> {
     // Calculate target dimensions accounting for character aspect ratio (~2:1)
     // We sample 2 vertical pixels for each character row
-    let target_width = IMAGE_WIDTH;
     let target_height = height_rows * 2; // Double because we'll sample 2 rows per char
+    
+    // Calculate target width based on image aspect ratio
+    // 1 char width = 1 unit, 1 char height = 2 units (roughly)
+    // So target_height pixels represents height_rows characters.
+    // To maintain aspect ratio:
+    // width_chars = height_chars * (image_w / image_h) * (char_h / char_w)
+    // width_chars = height_rows * (image_w / image_h) * 2.0
+    // Or simply: target_width_pixels = target_height_pixels * (image_w / image_h)
+    // Since we map 1 pixel to 1 char horizontally, and 2 pixels to 1 char vertically.
+    
+    let (img_w, img_h) = image.dimensions();
+    let mut aspect = img_w as f32 / img_h as f32;
+    
+    // If we have a wide display (132 cols), let's try to be at least 16:9
+    if display_width > 100 {
+        aspect = aspect.max(1.77);
+    }
+    
+    // Calculate ideal width to maintain aspect ratio
+    let ideal_width = (target_height as f32 * aspect) as u32;
+    
+    // Constrain to display width (minus padding)
+    let max_width = (display_width.saturating_sub(4)) as u32;
+    let target_width = ideal_width.min(max_width);
     
     // Resize and crop to fill the target dimensions FIRST
     // This drastically reduces the number of pixels for subsequent processing
@@ -255,31 +314,66 @@ fn image_to_ascii(image: &DynamicImage, height_rows: u32) -> Vec<String> {
     // Enhance contrast (now fast because image is tiny)
     let enhanced = enhance_contrast(&gray);
     
-    // Calculate padding for centering
-    let padding = (DISPLAY_WIDTH - IMAGE_WIDTH as usize) / 2;
-    let pad_str: String = " ".repeat(padding);
-    
     let mut lines = Vec::with_capacity(height_rows as usize);
     
     // Process 2 rows at a time, averaging them for each character row
     for row in 0..height_rows {
-        let mut line = String::with_capacity(DISPLAY_WIDTH);
-        line.push_str(&pad_str); // Left padding
+        let mut line = String::with_capacity(target_width as usize + 10);
         
-        for col in 0..IMAGE_WIDTH {
-            // Average the two vertical pixels for this character position
-            let y1 = row * 2;
-            let y2 = row * 2 + 1;
+        if use_drcs {
+            line.push_str(crate::drcs::SHIFT_OUT);
             
-            let p1 = enhanced.get_pixel(col, y1)[0] as u16;
-            let p2 = if y2 < target_height {
-                enhanced.get_pixel(col, y2)[0] as u16
-            } else {
-                p1
-            };
+            for col in 0..target_width {
+                // Average the two vertical pixels for this character position
+                let y1 = row * 2;
+                let y2 = row * 2 + 1;
+                
+                let p1 = enhanced.get_pixel(col, y1)[0] as u16;
+                let p2 = if y2 < target_height {
+                    enhanced.get_pixel(col, y2)[0] as u16
+                } else {
+                    p1
+                };
+                
+                let avg = ((p1 + p2) / 2) as u8;
+                let char = crate::drcs::brightness_to_drcs_char(avg);
+                line.push(char);
+            }
             
-            let avg = ((p1 + p2) / 2) as u8;
-            line.push(brightness_to_char(avg));
+            line.push_str(crate::drcs::SHIFT_IN);
+        } else {
+            // Enhanced ASCII mode (mix of ASCII and DEC graphics)
+            let mut current_is_dec = false;
+            
+            for col in 0..target_width {
+                // Average the two vertical pixels for this character position
+                let y1 = row * 2;
+                let y2 = row * 2 + 1;
+                
+                let p1 = enhanced.get_pixel(col, y1)[0] as u16;
+                let p2 = if y2 < target_height {
+                    enhanced.get_pixel(col, y2)[0] as u16
+                } else {
+                    p1
+                };
+                
+                let avg = ((p1 + p2) / 2) as u8;
+                let (char, is_dec) = brightness_to_enhanced_char(avg);
+                
+                if is_dec != current_is_dec {
+                    if is_dec {
+                        line.push_str(crate::drcs::SHIFT_OUT);
+                    } else {
+                        line.push_str(crate::drcs::SHIFT_IN);
+                    }
+                    current_is_dec = is_dec;
+                }
+                line.push(char);
+            }
+            
+            if current_is_dec {
+                line.push_str(crate::drcs::SHIFT_IN);
+            }
         }
         
         lines.push(line);

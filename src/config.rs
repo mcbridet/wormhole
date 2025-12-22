@@ -10,6 +10,36 @@ pub struct Config {
     pub webcam: WebcamConfig,
     #[serde(default)]
     pub gemini: GeminiConfig,
+    #[serde(default)]
+    pub terminal: TerminalConfig,
+    #[serde(default)]
+    pub logging: LogConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TerminalConfig {
+    /// Terminal emulation mode: "vt100" or "vt220"
+    #[serde(default = "default_terminal_mode")]
+    pub mode: String,
+}
+
+fn default_terminal_mode() -> String {
+    "vt100".to_string()
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_terminal_mode(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct LogConfig {
+    /// Directory to write log files to (optional, logging disabled if not set)
+    #[serde(default)]
+    pub directory: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

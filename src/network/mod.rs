@@ -16,9 +16,6 @@ pub use discovery::{run_discovery, DiscoveredPeer, Discovery, PEER_TIMEOUT};
 pub use stun::discover_public_endpoint;
 pub use upnp::setup_port_forward;
 
-/// Default port for wormhole P2P communication
-pub const DEFAULT_PORT: u16 = 7890;
-
 /// Message types for the protocol
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -32,6 +29,12 @@ pub enum Message {
     Join { name: String },
     /// Leave notification
     Leave { name: String },
+    /// Call request
+    CallRequest { from: String },
+    /// Call hangup notification
+    CallHangup { from: String },
+    /// Call rejected (busy)
+    CallReject { from: String },
     /// Stream frame (ASCII art lines)
     StreamFrame { from: String, lines: Vec<String> },
 }
@@ -65,6 +68,21 @@ impl Message {
                 buf.push(0x05);
                 buf.push(name.len() as u8);
                 buf.extend(name.as_bytes());
+            }
+            Message::CallRequest { from } => {
+                buf.push(0x07);
+                buf.push(from.len() as u8);
+                buf.extend(from.as_bytes());
+            }
+            Message::CallHangup { from } => {
+                buf.push(0x08);
+                buf.push(from.len() as u8);
+                buf.extend(from.as_bytes());
+            }
+            Message::CallReject { from } => {
+                buf.push(0x09);
+                buf.push(from.len() as u8);
+                buf.extend(from.as_bytes());
             }
             Message::StreamFrame { from, lines } => {
                 buf.push(0x06);
@@ -147,6 +165,42 @@ impl Message {
                 let name = String::from_utf8_lossy(&data[2..2 + name_len]).to_string();
                 Some(Message::Leave { name })
             }
+            0x07 => {
+                // CallRequest
+                if data.len() < 2 {
+                    return None;
+                }
+                let from_len = data[1] as usize;
+                if data.len() < 2 + from_len {
+                    return None;
+                }
+                let from = String::from_utf8_lossy(&data[2..2 + from_len]).to_string();
+                Some(Message::CallRequest { from })
+            }
+            0x08 => {
+                // CallHangup
+                if data.len() < 2 {
+                    return None;
+                }
+                let from_len = data[1] as usize;
+                if data.len() < 2 + from_len {
+                    return None;
+                }
+                let from = String::from_utf8_lossy(&data[2..2 + from_len]).to_string();
+                Some(Message::CallHangup { from })
+            }
+            0x09 => {
+                // CallReject
+                if data.len() < 2 {
+                    return None;
+                }
+                let from_len = data[1] as usize;
+                if data.len() < 2 + from_len {
+                    return None;
+                }
+                let from = String::from_utf8_lossy(&data[2..2 + from_len]).to_string();
+                Some(Message::CallReject { from })
+            }
             0x06 => {
                 // StreamFrame
                 if data.len() < 2 {
@@ -226,16 +280,6 @@ impl NetworkNode {
         })
     }
 
-    /// Get the local address
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
-    }
-
-    /// Get the public address (after STUN discovery)
-    pub fn public_addr(&self) -> Option<SocketAddr> {
-        self.public_addr
-    }
-
     /// Set the public address (from STUN discovery)
     pub fn set_public_addr(&mut self, addr: SocketAddr) {
         self.public_addr = Some(addr);
@@ -259,6 +303,11 @@ impl NetworkNode {
                 last_seen: std::time::Instant::now(),
             });
         }
+    }
+
+    /// Remove a peer by address
+    pub fn remove_peer(&mut self, addr: SocketAddr) {
+        self.peers.retain(|p| p.addr != addr);
     }
 
     /// Remove stale peers (not seen in the given duration)
@@ -285,15 +334,6 @@ impl NetworkNode {
     /// Get the number of connected peers
     pub fn peer_count(&self) -> usize {
         self.peers.len()
-    }
-
-    /// Remove a peer by address, returns the removed peer if found
-    pub fn remove_peer(&mut self, addr: SocketAddr) -> Option<Peer> {
-        if let Some(idx) = self.peers.iter().position(|p| p.addr == addr) {
-            Some(self.peers.remove(idx))
-        } else {
-            None
-        }
     }
 
     /// Check if a peer with the given address exists and is still active (not timed out)
@@ -339,20 +379,6 @@ impl NetworkNode {
         self.broadcast(&msg).await
     }
 
-    /// Receive a message (with timeout)
-    pub async fn recv(&self) -> Result<(Message, SocketAddr), NetworkError> {
-        let mut buf = [0u8; 2048];
-        let (len, addr) = self
-            .socket
-            .recv_from(&mut buf)
-            .await
-            .map_err(|e| NetworkError::Recv(e.to_string()))?;
-
-        Message::from_bytes(&buf[..len])
-            .ok_or(NetworkError::InvalidMessage)
-            .map(|msg| (msg, addr))
-    }
-
     /// Get a clone of the socket for async operations
     pub fn socket(&self) -> Arc<UdpSocket> {
         Arc::clone(&self.socket)
@@ -374,16 +400,14 @@ impl NetworkNode {
 
 #[derive(Debug)]
 pub enum PeerEvent {
-    Joined { name: String },
-    Left { name: String },
+    Joined { name: String, addr: SocketAddr },
+    Left { name: String, addr: SocketAddr },
 }
 
 #[derive(Debug)]
 pub enum NetworkError {
     Bind(String),
     Send(String),
-    Recv(String),
-    InvalidMessage,
     Stun(String),
     Upnp(String),
 }
@@ -393,8 +417,6 @@ impl std::fmt::Display for NetworkError {
         match self {
             NetworkError::Bind(e) => write!(f, "failed to bind socket: {}", e),
             NetworkError::Send(e) => write!(f, "failed to send: {}", e),
-            NetworkError::Recv(e) => write!(f, "failed to receive: {}", e),
-            NetworkError::InvalidMessage => write!(f, "invalid message format"),
             NetworkError::Stun(e) => write!(f, "STUN error: {}", e),
             NetworkError::Upnp(e) => write!(f, "UPnP error: {}", e),
         }
