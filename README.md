@@ -4,7 +4,7 @@ Wormhole is a serial terminal chat application designed for VT220 terminals (and
 
 ## Features
 
-- **Serial Communication**: Optimized for VT120+ terminals.
+- **Serial Communication and TUI**: Optimized for VT120+ terminals. Assumes 80col for VT100 and 132col for VT220+.
 - **DEC Character Set Support**: Support for DEC special graphics (VT100+) and DRCS mode (VT220+) for brightness shades. 
 - **P2P Chat**: Decentralised chat over UDP with peer discovery (LAN/STUN).
 - **Video Calling for some reason**: ASCII-art based video streaming from your webcam. No audio, sorry.
