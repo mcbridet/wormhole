@@ -1,6 +1,6 @@
 //! Webcam capture and ASCII art conversion for VT100/VT220 terminals.
 
-use crate::dec_graphics::DecGraphicsChar;
+use crate::graphics::{DecGraphicsChar, SHIFT_IN, SHIFT_OUT, brightness_to_drcs_char};
 use image::{DynamicImage, GenericImageView, imageops::FilterType};
 use nokhwa::{
     Camera,
@@ -353,7 +353,7 @@ fn image_to_ascii(
         let mut line = String::with_capacity(target_width as usize + 10);
 
         if use_drcs {
-            line.push_str(crate::drcs::SHIFT_OUT);
+            line.push_str(SHIFT_OUT);
 
             for col in 0..target_width {
                 // Average the two vertical pixels for this character position
@@ -368,11 +368,11 @@ fn image_to_ascii(
                 };
 
                 let avg = ((p1 + p2) / 2) as u8;
-                let char = crate::drcs::brightness_to_drcs_char(avg);
+                let char = brightness_to_drcs_char(avg);
                 line.push(char);
             }
 
-            line.push_str(crate::drcs::SHIFT_IN);
+            line.push_str(SHIFT_IN);
         } else {
             // Enhanced ASCII mode (mix of ASCII and DEC graphics)
             let mut current_is_dec = false;
@@ -394,9 +394,9 @@ fn image_to_ascii(
 
                 if is_dec != current_is_dec {
                     if is_dec {
-                        line.push_str(crate::drcs::SHIFT_OUT);
+                        line.push_str(SHIFT_OUT);
                     } else {
-                        line.push_str(crate::drcs::SHIFT_IN);
+                        line.push_str(SHIFT_IN);
                     }
                     current_is_dec = is_dec;
                 }
@@ -404,7 +404,7 @@ fn image_to_ascii(
             }
 
             if current_is_dec {
-                line.push_str(crate::drcs::SHIFT_IN);
+                line.push_str(SHIFT_IN);
             }
         }
 

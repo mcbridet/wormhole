@@ -1,0 +1,7 @@
+FROM ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:edge
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN dpkg --add-architecture armhf && \
+    apt-get update && \
+    apt-get install --assume-yes libudev-dev:armhf

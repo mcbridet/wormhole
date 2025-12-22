@@ -1,8 +1,8 @@
 mod app;
 mod config;
-mod dec_graphics;
-mod drcs;
 mod gemini;
+mod graphics;
+mod input;
 mod log;
 mod network;
 mod serial;
@@ -13,6 +13,7 @@ use app::App;
 use chrono::Local;
 use clap::Parser;
 use config::Config;
+use input::{EscapeParser, EscapeSequence, InputEvent, parse_byte};
 use network::{Message, PEER_TIMEOUT, PeerEvent};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -134,7 +135,7 @@ async fn main() {
     // Main loop - handle serial I/O and network messages
     let max_input_len = max_input_length(&app.config.network.name, width);
     let mut serial_buf = [0u8; 256];
-    let mut escape_buf: Vec<u8> = Vec::new(); // Buffer for escape sequences
+    let mut escape_parser = EscapeParser::new(); // Parser for escape sequences
     let mut last_reconnect_attempt = std::time::Instant::now();
     const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -700,149 +701,128 @@ async fn main() {
             Ok(n) => {
                 // Process input character by character
                 for &byte in &serial_buf[..n] {
-                    // Handle escape sequences for Page Up/Down
-                    if !escape_buf.is_empty() {
-                        escape_buf.push(byte);
-
-                        // Check for complete escape sequences
-                        // Page Up: ESC [ 5 ~
-                        // Page Down: ESC [ 6 ~
-                        // Arrow Keys: ESC [ A/B/C/D
-                        if escape_buf.len() >= 3 {
-                            let seq = &escape_buf[..];
-                            if seq == b"\x1b[5~" {
-                                // Page Up - scroll up (on active buffer)
-                                let active_buffer = if app.active_tab == Tab::Chat {
-                                    &mut app.chat_buffer
-                                } else {
-                                    &mut app.ai_buffer
-                                };
-                                active_buffer.scroll_up(10);
-                                let _ = app.serial.write_str(&active_buffer.render());
-                                escape_buf.clear();
-                                continue;
-                            } else if seq == b"\x1b[6~" {
-                                // Page Down - scroll down (on active buffer)
-                                let active_buffer = if app.active_tab == Tab::Chat {
-                                    &mut app.chat_buffer
-                                } else {
-                                    &mut app.ai_buffer
-                                };
-                                active_buffer.scroll_down(10);
-                                let _ = app.serial.write_str(&active_buffer.render());
-                                escape_buf.clear();
-                                continue;
-                            } else if seq == b"\x1b[A" {
-                                // Up Arrow - History Previous
-                                if app.active_tab != Tab::Call && !app.ai_processing {
-                                    if app.input_history.is_empty() {
-                                        escape_buf.clear();
-                                        continue;
-                                    }
-
-                                    let new_index = match app.history_index {
-                                        Some(i) => {
-                                            if i > 0 {
-                                                i - 1
-                                            } else {
-                                                0
-                                            }
-                                        }
-                                        None => app.input_history.len() - 1,
-                                    };
-
-                                    app.history_index = Some(new_index);
-                                    app.line_buffer = app.input_history[new_index].clone();
-                                    app.input_cursor = app.line_buffer.len();
-                                    let _ = app.serial.write_str(&redraw_input(
-                                        &app.config.network.name,
-                                        &app.line_buffer,
-                                        app.input_cursor,
-                                        width,
-                                    ));
-                                }
-                                escape_buf.clear();
-                                continue;
-                            } else if seq == b"\x1b[B" {
-                                // Down Arrow - History Next
-                                if app.active_tab != Tab::Call
-                                    && !app.ai_processing
-                                    && let Some(i) = app.history_index
-                                {
-                                    if i + 1 >= app.input_history.len() {
-                                        // End of history, clear input
-                                        app.history_index = None;
-                                        app.line_buffer.clear();
-                                        app.input_cursor = 0;
+                    // Handle escape sequences in progress
+                    if escape_parser.is_parsing() {
+                        if let Some(seq) = escape_parser.feed(byte) {
+                            match seq {
+                                EscapeSequence::PageUp => {
+                                    // Page Up - scroll up (on active buffer)
+                                    let active_buffer = if app.active_tab == Tab::Chat {
+                                        &mut app.chat_buffer
                                     } else {
-                                        let new_index = i + 1;
+                                        &mut app.ai_buffer
+                                    };
+                                    active_buffer.scroll_up(10);
+                                    let _ = app.serial.write_str(&active_buffer.render());
+                                }
+                                EscapeSequence::PageDown => {
+                                    // Page Down - scroll down (on active buffer)
+                                    let active_buffer = if app.active_tab == Tab::Chat {
+                                        &mut app.chat_buffer
+                                    } else {
+                                        &mut app.ai_buffer
+                                    };
+                                    active_buffer.scroll_down(10);
+                                    let _ = app.serial.write_str(&active_buffer.render());
+                                }
+                                EscapeSequence::ArrowUp => {
+                                    // Up Arrow - History Previous
+                                    if app.active_tab != Tab::Call
+                                        && !app.ai_processing
+                                        && !app.input_history.is_empty()
+                                    {
+                                        let new_index = match app.history_index {
+                                            Some(i) => {
+                                                if i > 0 {
+                                                    i - 1
+                                                } else {
+                                                    0
+                                                }
+                                            }
+                                            None => app.input_history.len() - 1,
+                                        };
+
                                         app.history_index = Some(new_index);
                                         app.line_buffer = app.input_history[new_index].clone();
                                         app.input_cursor = app.line_buffer.len();
+                                        let _ = app.serial.write_str(&redraw_input(
+                                            &app.config.network.name,
+                                            &app.line_buffer,
+                                            app.input_cursor,
+                                            width,
+                                        ));
                                     }
-                                    let _ = app.serial.write_str(&redraw_input(
-                                        &app.config.network.name,
-                                        &app.line_buffer,
-                                        app.input_cursor,
-                                        width,
-                                    ));
                                 }
-                                escape_buf.clear();
-                                continue;
-                            } else if seq == b"\x1b[C" {
-                                // Right Arrow - Move Cursor Right
-                                if app.active_tab != Tab::Call
-                                    && !app.ai_processing
-                                    && app.input_cursor < app.line_buffer.len()
-                                {
-                                    app.input_cursor += 1;
-                                    let _ = app.serial.write_str(&redraw_input(
-                                        &app.config.network.name,
-                                        &app.line_buffer,
-                                        app.input_cursor,
-                                        width,
-                                    ));
+                                EscapeSequence::ArrowDown => {
+                                    // Down Arrow - History Next
+                                    if app.active_tab != Tab::Call
+                                        && !app.ai_processing
+                                        && let Some(i) = app.history_index
+                                    {
+                                        if i + 1 >= app.input_history.len() {
+                                            // End of history, clear input
+                                            app.history_index = None;
+                                            app.line_buffer.clear();
+                                            app.input_cursor = 0;
+                                        } else {
+                                            let new_index = i + 1;
+                                            app.history_index = Some(new_index);
+                                            app.line_buffer = app.input_history[new_index].clone();
+                                            app.input_cursor = app.line_buffer.len();
+                                        }
+                                        let _ = app.serial.write_str(&redraw_input(
+                                            &app.config.network.name,
+                                            &app.line_buffer,
+                                            app.input_cursor,
+                                            width,
+                                        ));
+                                    }
                                 }
-                                escape_buf.clear();
-                                continue;
-                            } else if seq == b"\x1b[D" {
-                                // Left Arrow - Move Cursor Left
-                                if app.active_tab != Tab::Call
-                                    && !app.ai_processing
-                                    && app.input_cursor > 0
-                                {
-                                    app.input_cursor -= 1;
-                                    let _ = app.serial.write_str(&redraw_input(
-                                        &app.config.network.name,
-                                        &app.line_buffer,
-                                        app.input_cursor,
-                                        width,
-                                    ));
+                                EscapeSequence::ArrowRight => {
+                                    // Right Arrow - Move Cursor Right
+                                    if app.active_tab != Tab::Call
+                                        && !app.ai_processing
+                                        && app.input_cursor < app.line_buffer.len()
+                                    {
+                                        app.input_cursor += 1;
+                                        let _ = app.serial.write_str(&redraw_input(
+                                            &app.config.network.name,
+                                            &app.line_buffer,
+                                            app.input_cursor,
+                                            width,
+                                        ));
+                                    }
                                 }
-                                escape_buf.clear();
-                                continue;
-                            } else if seq.len() > 6
-                                || (seq.len() >= 3 && seq[seq.len() - 1] == b'~')
-                                || (seq.len() >= 3
-                                    && seq[seq.len() - 1] >= b'A'
-                                    && seq[seq.len() - 1] <= b'D')
-                            {
-                                // Unknown or complete sequence, discard
-                                escape_buf.clear();
-                                continue;
+                                EscapeSequence::ArrowLeft => {
+                                    // Left Arrow - Move Cursor Left
+                                    if app.active_tab != Tab::Call
+                                        && !app.ai_processing
+                                        && app.input_cursor > 0
+                                    {
+                                        app.input_cursor -= 1;
+                                        let _ = app.serial.write_str(&redraw_input(
+                                            &app.config.network.name,
+                                            &app.line_buffer,
+                                            app.input_cursor,
+                                            width,
+                                        ));
+                                    }
+                                }
+                                EscapeSequence::Unknown => {
+                                    // Unknown sequence, ignore
+                                }
                             }
-                            // Still building sequence, continue
-                            continue;
                         }
                         continue;
                     }
 
-                    match byte {
-                        0x1b => {
+                    // Parse the byte into an input event
+                    match parse_byte(byte) {
+                        InputEvent::EscapeStart => {
                             // Start of escape sequence
-                            escape_buf.push(byte);
+                            escape_parser.feed(byte);
                         }
-                        b'\r' | b'\n' => {
+                        InputEvent::Enter => {
                             if app.ai_processing {
                                 continue;
                             }
@@ -1388,7 +1368,7 @@ async fn main() {
                                 }
                             }
                         }
-                        0x7f | 0x08 => {
+                        InputEvent::Backspace => {
                             // Backspace
                             if app.ai_processing {
                                 continue;
@@ -1415,7 +1395,7 @@ async fn main() {
                                 ));
                             }
                         }
-                        0x03 => {
+                        InputEvent::CtrlC => {
                             // Ctrl+C - Clear buffer or reset AI
                             match app.active_tab {
                                 Tab::Chat => {
@@ -1439,7 +1419,7 @@ async fn main() {
                                 }
                             }
                         }
-                        0x09 => {
+                        InputEvent::Tab => {
                             // Tab key - switch tabs
                             let prev_tab = app.active_tab;
                             let gemini_available = app.gemini_chat.is_some();
@@ -1520,7 +1500,7 @@ async fn main() {
                                 }
                             }
                         }
-                        0x12 => {
+                        InputEvent::CtrlR => {
                             // Ctrl+R - Refresh screen (useful if terminal reconnects)
                             let status = if app.active_tab == Tab::Call {
                                 app.active_call.as_ref().map(|peer_name| {
@@ -1565,8 +1545,8 @@ async fn main() {
                                 }
                             }
                         }
-                        _ => {
-                            if app.active_tab == Tab::Call && byte == 0x20 {
+                        InputEvent::Space => {
+                            if app.active_tab == Tab::Call {
                                 // Space bar in Call tab - Hang up
                                 if let Some(peer_name) = app.active_call.take() {
                                     // Send hangup message
@@ -1620,7 +1600,28 @@ async fn main() {
                                         width,
                                     ));
                                 }
-                            } else if app.active_tab != Tab::Call && (0x20..0x7f).contains(&byte) {
+                            } else if app.active_tab != Tab::Call {
+                                // Space is also a printable character in other tabs
+                                if !app.ai_processing && app.line_buffer.len() < max_input_len {
+                                    let byte_idx = app
+                                        .line_buffer
+                                        .chars()
+                                        .take(app.input_cursor)
+                                        .map(|c| c.len_utf8())
+                                        .sum();
+                                    app.line_buffer.insert(byte_idx, ' ');
+                                    app.input_cursor += 1;
+                                    let _ = app.serial.write_str(&redraw_input(
+                                        &app.config.network.name,
+                                        &app.line_buffer,
+                                        app.input_cursor,
+                                        width,
+                                    ));
+                                }
+                            }
+                        }
+                        InputEvent::Char(c) => {
+                            if app.active_tab != Tab::Call {
                                 if app.ai_processing {
                                     continue;
                                 }
@@ -1632,7 +1633,7 @@ async fn main() {
                                         .take(app.input_cursor)
                                         .map(|c| c.len_utf8())
                                         .sum();
-                                    app.line_buffer.insert(byte_idx, byte as char);
+                                    app.line_buffer.insert(byte_idx, c);
                                     app.input_cursor += 1;
                                     // Redraw input area to handle wrapping
                                     let _ = app.serial.write_str(&redraw_input(
@@ -1644,6 +1645,9 @@ async fn main() {
                                 }
                                 // Silently ignore input when buffer is full
                             }
+                        }
+                        InputEvent::Escape(_) | InputEvent::Ignore => {
+                            // Handled above or ignored
                         }
                     }
                 }

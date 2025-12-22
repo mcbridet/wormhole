@@ -11,7 +11,7 @@ env:
 
 jobs:
   lint:
-    name: Check, Format & Clippy
+    name: Check, Format, Clippy, Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,18 +28,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libudev-dev
-      - run: cargo test
+      - name: Run tests
+        run: cargo test
 
   build:
     name: Build
