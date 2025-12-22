@@ -12,7 +12,7 @@ mod discovery;
 mod stun;
 mod upnp;
 
-pub use discovery::{run_discovery, DiscoveredPeer, Discovery, PEER_TIMEOUT};
+pub use discovery::{DiscoveredPeer, Discovery, PEER_TIMEOUT, run_discovery};
 pub use stun::discover_public_endpoint;
 pub use upnp::setup_port_forward;
 
@@ -120,9 +120,8 @@ impl Message {
                 if data.len() < 4 + from_len + text_len {
                     return None;
                 }
-                let text =
-                    String::from_utf8_lossy(&data[4 + from_len..4 + from_len + text_len])
-                        .to_string();
+                let text = String::from_utf8_lossy(&data[4 + from_len..4 + from_len + text_len])
+                    .to_string();
                 Some(Message::Chat { from, text })
             }
             0x02 => {
@@ -211,11 +210,11 @@ impl Message {
                     return None;
                 }
                 let from = String::from_utf8_lossy(&data[2..2 + from_len]).to_string();
-                
+
                 let mut offset = 2 + from_len;
                 let num_lines = data[offset] as usize;
                 offset += 1;
-                
+
                 let mut lines = Vec::with_capacity(num_lines);
                 for _ in 0..num_lines {
                     if data.len() < offset + 2 {
@@ -223,15 +222,16 @@ impl Message {
                     }
                     let line_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
                     offset += 2;
-                    
+
                     if data.len() < offset + line_len {
                         return None;
                     }
-                    let line = String::from_utf8_lossy(&data[offset..offset + line_len]).to_string();
+                    let line =
+                        String::from_utf8_lossy(&data[offset..offset + line_len]).to_string();
                     lines.push(line);
                     offset += line_len;
                 }
-                
+
                 Some(Message::StreamFrame { from, lines })
             }
             _ => None,
@@ -339,9 +339,9 @@ impl NetworkNode {
     /// Check if a peer with the given address exists and is still active (not timed out)
     pub fn has_peer(&self, addr: SocketAddr, timeout: Duration) -> bool {
         let now = std::time::Instant::now();
-        self.peers.iter().any(|p| {
-            p.addr == addr && now.duration_since(p.last_seen) < timeout
-        })
+        self.peers
+            .iter()
+            .any(|p| p.addr == addr && now.duration_since(p.last_seen) < timeout)
     }
 
     /// Update the last_seen time for a peer

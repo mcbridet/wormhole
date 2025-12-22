@@ -16,7 +16,7 @@ pub fn get_init_sequence(use_drcs: bool, use_132_cols: bool) -> String {
     } else {
         output.push_str(EXIT_132_COL_MODE);
     }
-    
+
     if use_drcs {
         output.push_str(&crate::drcs::get_drcs_load_sequence());
     }
@@ -44,7 +44,6 @@ pub const INPUT_ROWS: usize = INPUT_ROW_END - INPUT_ROW_START + 1; // 2 rows
 /// Input area dimensions
 /// Each row has: left border (1) + content (width-4) + space (1) + right border (1) = width visible
 /// First row also has prompt taking some space
-
 /// Maximum scrollback buffer size
 pub const MAX_SCROLLBACK: usize = 10_000;
 
@@ -114,33 +113,33 @@ impl ChatBuffer {
     /// Returns true if a new line was created or modified (requiring multi-line redraw)
     pub fn type_char(&mut self, ch: char, indent: &str) -> bool {
         let max_len = self.width - 4;
-        
+
         if self.lines.is_empty() {
             self.lines.push_back(String::new());
         }
-        
+
         let last_idx = self.lines.len() - 1;
         let current_len = visible_len(&self.lines[last_idx]);
-        
+
         if current_len + 1 > max_len {
             // Need to wrap
             let mut word_to_move = String::new();
             let mut truncated_line = String::new();
             let mut moved = false;
-            
+
             // Try word wrapping if not whitespace
             if !ch.is_whitespace() {
                 let last_line = &self.lines[last_idx];
                 if let Some(last_space) = last_line.rfind(' ') {
                     // Only move if it's not the whole line and not too long
                     if last_line.len() - last_space < max_len / 2 {
-                        word_to_move = last_line[last_space+1..].to_string();
+                        word_to_move = last_line[last_space + 1..].to_string();
                         truncated_line = last_line[..last_space].to_string();
                         moved = true;
                     }
                 }
             }
-            
+
             if moved {
                 self.lines[last_idx] = truncated_line;
                 let mut new_line = String::from(indent);
@@ -168,15 +167,15 @@ impl ChatBuffer {
         }
 
         let max_len = self.width - 4; // "│ " on left, " │" on right
-        
+
         for line in message.lines() {
             let mut current_line = String::new();
             let mut first_word = true;
-            
+
             for word in line.split(' ') {
                 let space_len = if first_word { 0 } else { 1 };
                 let word_len = word.len();
-                
+
                 if current_line.len() + space_len + word_len > max_len {
                     // Line full, push it
                     if !current_line.is_empty() {
@@ -185,7 +184,7 @@ impl ChatBuffer {
                         // first_word becomes true for the new line, but we immediately add the current word
                         // so it will become false again at the end of this iteration.
                     }
-                    
+
                     // Now handle the word
                     if word.len() > max_len {
                         // Word too long, split it
@@ -210,7 +209,7 @@ impl ChatBuffer {
                     first_word = false;
                 }
             }
-            
+
             // Push the last line
             if !current_line.is_empty() || line.is_empty() {
                 self.push_raw(current_line);
@@ -221,7 +220,7 @@ impl ChatBuffer {
     /// Internal helper to push a single line and handle capacity
     fn push_raw(&mut self, line: String) {
         self.lines.push_back(line);
-        
+
         // Remove old lines if over capacity
         while self.lines.len() > MAX_SCROLLBACK {
             self.lines.pop_front();
@@ -231,7 +230,7 @@ impl ChatBuffer {
             }
         }
     }
-    
+
     /// Update the last line in the buffer (useful for streaming)
     pub fn update_last_line(&mut self, content: &str) {
         let max_len = self.width - 4;
@@ -240,7 +239,7 @@ impl ChatBuffer {
         } else {
             content.to_string()
         };
-        
+
         if let Some(last) = self.lines.back_mut() {
             *last = truncated;
         }
@@ -251,36 +250,36 @@ impl ChatBuffer {
         self.lines.clear();
         self.scroll_offset = 0;
     }
-    
+
     /// Scroll up by n lines
     pub fn scroll_up(&mut self, n: usize) {
         let max_offset = self.lines.len().saturating_sub(CHAT_VISIBLE_LINES);
         self.scroll_offset = (self.scroll_offset + n).min(max_offset);
     }
-    
+
     /// Scroll down by n lines
     pub fn scroll_down(&mut self, n: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(n);
     }
-    
+
     /// Scroll to bottom (most recent messages)
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
     }
-    
+
     /// Get the lines currently visible in the display window
     fn visible_lines(&self) -> Vec<&str> {
         let total = self.lines.len();
         if total == 0 {
             return vec![];
         }
-        
+
         // Calculate the range of lines to show
         // scroll_offset=0 means show the last CHAT_VISIBLE_LINES
         // scroll_offset=N means show N lines earlier
         let end = total.saturating_sub(self.scroll_offset);
         let start = end.saturating_sub(CHAT_VISIBLE_LINES);
-        
+
         self.lines
             .iter()
             .skip(start)
@@ -288,36 +287,36 @@ impl ChatBuffer {
             .map(|s| s.as_str())
             .collect()
     }
-    
+
     /// Render the last n visible lines
     pub fn render_bottom_lines(&self, n: usize) -> String {
         use DecGraphicsChar::VerticalLine;
-        
+
         let visible = self.visible_lines();
         if visible.is_empty() {
             return String::new();
         }
-        
+
         let count = n.min(visible.len());
         let start_idx = visible.len() - count;
-        
+
         let mut output = String::new();
         output.push_str(esc::SAVE_CURSOR);
-        
+
         for i in 0..count {
             let row_idx = start_idx + i;
             let screen_row = CHAT_REGION_START + row_idx;
             let line = visible[row_idx];
             let max_len = self.width - 4;
-            
+
             output.push_str(&esc::cursor_to(screen_row, 1));
-            
+
             // Left border
             output.push_str(ENTER_DEC_GRAPHICS);
             output.push(VerticalLine.as_dec_char());
             output.push_str(EXIT_DEC_GRAPHICS);
             output.push(' ');
-            
+
             // Content
             output.push_str(line);
             // Pad
@@ -325,14 +324,14 @@ impl ChatBuffer {
             for _ in vis_len..max_len {
                 output.push(' ');
             }
-            
+
             // Right border
             output.push(' ');
             output.push_str(ENTER_DEC_GRAPHICS);
             output.push(VerticalLine.as_dec_char());
             output.push_str(EXIT_DEC_GRAPHICS);
         }
-        
+
         output.push_str(esc::RESTORE_CURSOR);
         output
     }
@@ -340,27 +339,27 @@ impl ChatBuffer {
     /// Render only the last visible line (optimization for streaming)
     pub fn render_last_line(&self) -> String {
         use DecGraphicsChar::VerticalLine;
-        
+
         let visible = self.visible_lines();
         if visible.is_empty() {
             return String::new();
         }
-        
+
         let row_idx = visible.len() - 1;
         let screen_row = CHAT_REGION_START + row_idx;
         let line = visible[row_idx];
         let max_len = self.width - 4;
-        
+
         let mut output = String::new();
         output.push_str(esc::SAVE_CURSOR);
         output.push_str(&esc::cursor_to(screen_row, 1));
-        
+
         // Left border
         output.push_str(ENTER_DEC_GRAPHICS);
         output.push(VerticalLine.as_dec_char());
         output.push_str(EXIT_DEC_GRAPHICS);
         output.push(' ');
-        
+
         // Content
         output.push_str(line);
         // Pad
@@ -368,13 +367,13 @@ impl ChatBuffer {
         for _ in vis_len..max_len {
             output.push(' ');
         }
-        
+
         // Right border
         output.push(' ');
         output.push_str(ENTER_DEC_GRAPHICS);
         output.push(VerticalLine.as_dec_char());
         output.push_str(EXIT_DEC_GRAPHICS);
-        
+
         output.push_str(esc::RESTORE_CURSOR);
         output
     }
@@ -382,25 +381,25 @@ impl ChatBuffer {
     /// Render the entire chat area
     pub fn render(&self) -> String {
         use DecGraphicsChar::VerticalLine;
-        
+
         let mut output = String::new();
         let visible = self.visible_lines();
         let max_len = self.width - 4;
-        
+
         // Save cursor
         output.push_str(esc::SAVE_CURSOR);
-        
+
         // Draw each row in the chat area
         for row_idx in 0..CHAT_VISIBLE_LINES {
             let screen_row = CHAT_REGION_START + row_idx;
             output.push_str(&esc::cursor_to(screen_row, 1));
-            
+
             // Left border
             output.push_str(ENTER_DEC_GRAPHICS);
             output.push(VerticalLine.as_dec_char());
             output.push_str(EXIT_DEC_GRAPHICS);
             output.push(' ');
-            
+
             // Content or empty
             if row_idx < visible.len() {
                 let line = visible[row_idx];
@@ -416,36 +415,43 @@ impl ChatBuffer {
                     output.push(' ');
                 }
             }
-            
+
             // Right border
             output.push(' ');
             output.push_str(ENTER_DEC_GRAPHICS);
             output.push(VerticalLine.as_dec_char());
             output.push_str(EXIT_DEC_GRAPHICS);
         }
-        
+
         // Restore cursor
         output.push_str(esc::RESTORE_CURSOR);
-        
+
         output
     }
 }
 
 /// Render a stream frame to the content area
-pub fn render_stream(_sender: &str, lines: &[String], prev_lines: Option<&Vec<String>>, width: usize) -> String {
+pub fn render_stream(
+    _sender: &str,
+    lines: &[String],
+    prev_lines: Option<&Vec<String>>,
+    width: usize,
+) -> String {
     let mut output = String::new();
-    
+
     // Calculate centering
     let frame_height = lines.len();
-    let frame_width = if frame_height > 0 { 
+    let frame_width = if frame_height > 0 {
         let line = &lines[0];
         visible_len(line)
-    } else { 0 };
-    
+    } else {
+        0
+    };
+
     // Use integer division for centering, but ensure we don't start before CHAT_REGION_START
     let start_row = CHAT_REGION_START + (CALL_VISIBLE_LINES.saturating_sub(frame_height)) / 2;
     let start_col = (width.saturating_sub(frame_width)) / 2 + 1; // 1-based
-    
+
     // Check if we can do differential rendering
     let can_diff = if let Some(prev) = prev_lines {
         // Only diff if dimensions match (centering hasn't changed)
@@ -461,23 +467,25 @@ pub fn render_stream(_sender: &str, lines: &[String], prev_lines: Option<&Vec<St
     // Draw frame
     for (i, line) in lines.iter().enumerate() {
         let row = start_row + i;
-        if row >= CALL_REGION_END { break; }
-        
+        if row >= CALL_REGION_END {
+            break;
+        }
+
         if can_diff {
             let prev_line = &prev_lines.unwrap()[i];
             if line == prev_line {
                 continue; // Skip identical lines
             }
             // If line changed, redraw the whole line.
-            // We previously tried to diff segments within the line, but this is 
+            // We previously tried to diff segments within the line, but this is
             // unreliable with hybrid ASCII/DEC graphics where escape codes are interspersed.
         }
-        
+
         // Full redraw of the line
         output.push_str(&esc::cursor_to(row, start_col));
         output.push_str(line);
     }
-    
+
     output
 }
 
@@ -485,33 +493,33 @@ pub fn render_stream(_sender: &str, lines: &[String], prev_lines: Option<&Vec<St
 pub mod esc {
     /// Clear entire screen
     pub const CLEAR_SCREEN: &str = "\x1b[2J";
-    
+
     /// Move cursor to home position (1,1)
     pub const CURSOR_HOME: &str = "\x1b[H";
-    
+
     /// Hide cursor
     pub const CURSOR_HIDE: &str = "\x1b[?25l";
-    
+
     /// Show cursor
     pub const CURSOR_SHOW: &str = "\x1b[?25h";
-    
+
     /// Reset all attributes
     pub const RESET_ATTRS: &str = "\x1b[0m";
-    
+
     /// Reverse video
     pub const REVERSE: &str = "\x1b[7m";
-    
+
     /// Save cursor position
     pub const SAVE_CURSOR: &str = "\x1b7";
-    
+
     /// Restore cursor position
     pub const RESTORE_CURSOR: &str = "\x1b8";
-    
+
     /// Move cursor to specific position (1-indexed)
     pub fn cursor_to(row: usize, col: usize) -> String {
         format!("\x1b[{};{}H", row, col)
     }
-    
+
     /// Reset scroll region to full screen
     pub fn reset_scroll_region() -> String {
         "\x1b[r".to_string()
@@ -521,7 +529,7 @@ pub mod esc {
 /// Draw a horizontal line with optional left/right connectors
 fn draw_horizontal_line(left: DecGraphicsChar, right: DecGraphicsChar, width: usize) -> String {
     use DecGraphicsChar::HorizontalLine;
-    
+
     let mut output = String::new();
     output.push_str(ENTER_DEC_GRAPHICS);
     output.push(left.as_dec_char());
@@ -534,25 +542,30 @@ fn draw_horizontal_line(left: DecGraphicsChar, right: DecGraphicsChar, width: us
 }
 
 /// Draw the top border with tab indicators
-fn draw_tab_bar(active_tab: Tab, gemini_available: bool, active_call: Option<&str>, width: usize) -> String {
+fn draw_tab_bar(
+    active_tab: Tab,
+    gemini_available: bool,
+    active_call: Option<&str>,
+    width: usize,
+) -> String {
     use DecGraphicsChar::*;
-    
+
     let mut output = String::new();
     output.push_str(&esc::cursor_to(1, 1));
-    
+
     // Start with upper left corner
     output.push_str(ENTER_DEC_GRAPHICS);
     output.push(UpperLeftCorner.as_dec_char());
     output.push_str(EXIT_DEC_GRAPHICS);
-    
+
     // Helper to draw a tab
     let draw_tab = |label: &str, is_active: bool, is_next: bool| -> String {
         if is_active {
             format!("{}[{}]{}", esc::REVERSE, label, esc::RESET_ATTRS)
         } else if is_next {
-             format!(" {} <Tab> ", label)
+            format!(" {} <Tab> ", label)
         } else {
-             format!(" {} ", label)
+            format!(" {} ", label)
         }
     };
 
@@ -560,16 +573,24 @@ fn draw_tab_bar(active_tab: Tab, gemini_available: bool, active_call: Option<&st
     let next_tab = active_tab.next(gemini_available, active_call.is_some());
 
     // Chat Tab
-    output.push_str(&draw_tab("Chat", active_tab == Tab::Chat, next_tab == Tab::Chat));
-    
+    output.push_str(&draw_tab(
+        "Chat",
+        active_tab == Tab::Chat,
+        next_tab == Tab::Chat,
+    ));
+
     // Call Tab (if active)
     if let Some(peer_name) = active_call {
         output.push_str(ENTER_DEC_GRAPHICS);
         output.push(HorizontalLine.as_dec_char());
         output.push_str(EXIT_DEC_GRAPHICS);
-        
+
         let label = format!("Call ({})", peer_name);
-        output.push_str(&draw_tab(&label, active_tab == Tab::Call, next_tab == Tab::Call));
+        output.push_str(&draw_tab(
+            &label,
+            active_tab == Tab::Call,
+            next_tab == Tab::Call,
+        ));
     }
 
     // AI Tab (if available)
@@ -577,64 +598,92 @@ fn draw_tab_bar(active_tab: Tab, gemini_available: bool, active_call: Option<&st
         output.push_str(ENTER_DEC_GRAPHICS);
         output.push(HorizontalLine.as_dec_char());
         output.push_str(EXIT_DEC_GRAPHICS);
-        
-        output.push_str(&draw_tab("AI", active_tab == Tab::Gemini, next_tab == Tab::Gemini));
+
+        output.push_str(&draw_tab(
+            "AI",
+            active_tab == Tab::Gemini,
+            next_tab == Tab::Gemini,
+        ));
     }
-    
+
     // Hints: ^Refresh / ^Clear
     let hints = " ^Refresh / ^Clear ";
-    
+
     // Calculate used length
     let mut visible_len = 1; // Corner
-    
+
     // Chat
-    visible_len += if active_tab == Tab::Chat { 6 } else if next_tab == Tab::Chat { 12 } else { 6 };
-    
+    visible_len += if active_tab == Tab::Chat {
+        6
+    } else if next_tab == Tab::Chat {
+        12
+    } else {
+        6
+    };
+
     // Call
     if let Some(peer_name) = active_call {
         visible_len += 1; // Separator
         let label_len = 7 + peer_name.len();
         let tab_len = label_len + 2;
         let next_len = label_len + 8;
-        visible_len += if active_tab == Tab::Call { tab_len } else if next_tab == Tab::Call { next_len } else { tab_len };
+        visible_len += if active_tab == Tab::Call {
+            tab_len
+        } else if next_tab == Tab::Call {
+            next_len
+        } else {
+            tab_len
+        };
     }
 
     // AI
     if gemini_available {
         visible_len += 1; // Separator
-        visible_len += if active_tab == Tab::Gemini { 4 } else if next_tab == Tab::Gemini { 10 } else { 4 };
+        visible_len += if active_tab == Tab::Gemini {
+            4
+        } else if next_tab == Tab::Gemini {
+            10
+        } else {
+            4
+        };
     }
-    
+
     visible_len += hints.len();
     visible_len += 1; // Right corner
-    
+
     // Fill with horizontal line
-    let remaining = if visible_len < width {
-        width - visible_len
-    } else {
-        0
-    };
-    
+    let remaining = width.saturating_sub(visible_len);
+
     output.push_str(ENTER_DEC_GRAPHICS);
     for _ in 0..remaining {
         output.push(HorizontalLine.as_dec_char());
     }
     output.push_str(EXIT_DEC_GRAPHICS);
-    
+
     output.push_str(hints);
-    
+
     output.push_str(ENTER_DEC_GRAPHICS);
     output.push(UpperRightCorner.as_dec_char());
     output.push_str(EXIT_DEC_GRAPHICS);
-    
+
     output
 }
 
 /// Redraw just the tab bar (for switching tabs without full redraw)
-pub fn redraw_tab_bar(active_tab: Tab, gemini_available: bool, active_call: Option<&str>, width: usize) -> String {
+pub fn redraw_tab_bar(
+    active_tab: Tab,
+    gemini_available: bool,
+    active_call: Option<&str>,
+    width: usize,
+) -> String {
     let mut output = String::new();
     output.push_str(esc::SAVE_CURSOR);
-    output.push_str(&draw_tab_bar(active_tab, gemini_available, active_call, width));
+    output.push_str(&draw_tab_bar(
+        active_tab,
+        gemini_available,
+        active_call,
+        width,
+    ));
     output.push_str(esc::RESTORE_CURSOR);
     output
 }
@@ -644,29 +693,41 @@ pub fn max_input_length(client_name: &str, width: usize) -> usize {
     let prompt = format!("[{}] ", client_name);
     let prompt_len = prompt.len();
     let input_content_width = width - 4;
-    
+
     // First row: content width minus prompt
     let first_row_capacity = input_content_width - prompt_len;
     // Subsequent rows: full content width
     let other_rows_capacity = input_content_width * (INPUT_ROWS - 1);
-    
+
     first_row_capacity + other_rows_capacity
 }
 
 /// Initialize the split-screen UI with borders and tab support
-pub fn init_split_screen_with_tabs(client_name: &str, active_tab: Tab, gemini_available: bool, active_call: Option<&str>, call_status: Option<&str>, width: usize) -> String {
+pub fn init_split_screen_with_tabs(
+    client_name: &str,
+    active_tab: Tab,
+    gemini_available: bool,
+    active_call: Option<&str>,
+    call_status: Option<&str>,
+    width: usize,
+) -> String {
     use DecGraphicsChar::*;
-    
+
     let prompt = format!("[{}] ", client_name);
     let mut output = String::new();
-    
+
     // Clear screen
     output.push_str(esc::CLEAR_SCREEN);
     output.push_str(esc::CURSOR_HOME);
-    
+
     // Row 1: Top border with tabs
-    output.push_str(&draw_tab_bar(active_tab, gemini_available, active_call, width));
-    
+    output.push_str(&draw_tab_bar(
+        active_tab,
+        gemini_available,
+        active_call,
+        width,
+    ));
+
     if active_tab == Tab::Call {
         // Draw full box for Call (no split)
         // Rows 2-23: Left and right borders
@@ -680,11 +741,15 @@ pub fn init_split_screen_with_tabs(client_name: &str, active_tab: Tab, gemini_av
             output.push(VerticalLine.as_dec_char());
             output.push_str(EXIT_DEC_GRAPHICS);
         }
-        
+
         // Row 24: Bottom border
         output.push_str(&esc::cursor_to(24, 1));
-        output.push_str(&draw_horizontal_line(LowerLeftCorner, LowerRightCorner, width));
-        
+        output.push_str(&draw_horizontal_line(
+            LowerLeftCorner,
+            LowerRightCorner,
+            width,
+        ));
+
         // Draw status message if provided
         if let Some(status) = call_status {
             output.push_str(&esc::cursor_to(23, 3)); // Inside the box
@@ -693,7 +758,6 @@ pub fn init_split_screen_with_tabs(client_name: &str, active_tab: Tab, gemini_av
 
         // Hide cursor
         output.push_str(esc::CURSOR_HIDE);
-        
     } else {
         // Rows 2-19: Left and right borders for chat area
         for row in CHAT_REGION_START..=CHAT_REGION_END {
@@ -706,11 +770,11 @@ pub fn init_split_screen_with_tabs(client_name: &str, active_tab: Tab, gemini_av
             output.push(VerticalLine.as_dec_char());
             output.push_str(EXIT_DEC_GRAPHICS);
         }
-        
+
         // Row 21: Separator ├────────────────────┤
         output.push_str(&esc::cursor_to(21, 1));
         output.push_str(&draw_horizontal_line(LeftTee, RightTee, width));
-        
+
         // Rows 21-23: Input area borders
         for row in INPUT_ROW_START..=INPUT_ROW_END {
             output.push_str(&esc::cursor_to(row, 1));
@@ -722,53 +786,57 @@ pub fn init_split_screen_with_tabs(client_name: &str, active_tab: Tab, gemini_av
             output.push(VerticalLine.as_dec_char());
             output.push_str(EXIT_DEC_GRAPHICS);
         }
-        
+
         // Draw prompt on first input row
         output.push_str(&esc::cursor_to(INPUT_ROW_START, 2));
         output.push_str(&prompt);
-        
+
         // Row 24: Bottom border └────────────────────┘
         output.push_str(&esc::cursor_to(24, 1));
-        output.push_str(&draw_horizontal_line(LowerLeftCorner, LowerRightCorner, width));
-        
+        output.push_str(&draw_horizontal_line(
+            LowerLeftCorner,
+            LowerRightCorner,
+            width,
+        ));
+
         // No scroll region - we manage scrolling ourselves via ChatBuffer
-        
+
         // Position cursor at input area (after prompt)
         output.push_str(&esc::cursor_to(INPUT_ROW_START, 2 + prompt.len()));
-        
+
         // Show cursor
         output.push_str(esc::CURSOR_SHOW);
     }
-    
+
     output
 }
 
 /// Redraw the input line with current buffer content and cursor position
 pub fn redraw_input(client_name: &str, buffer: &str, cursor_pos: usize, width: usize) -> String {
     use DecGraphicsChar::VerticalLine;
-    
+
     let prompt = format!("[{}] ", client_name);
     let prompt_len = prompt.chars().count();
     let mut output = String::new();
     let input_content_width = width - 4;
-    
+
     // Calculate capacity for each row
     let first_row_capacity = input_content_width - prompt_len;
-    
+
     // Split buffer into rows
     let mut remaining = buffer;
     let mut row_contents: Vec<&str> = Vec::new();
-    
+
     // Helper to find byte index for split
     let get_split_idx = |s: &str, cap: usize| -> usize {
         s.char_indices().map(|(i, _)| i).nth(cap).unwrap_or(s.len())
     };
-    
+
     // First row gets less space due to prompt
     let split_idx = get_split_idx(remaining, first_row_capacity);
     row_contents.push(&remaining[..split_idx]);
     remaining = &remaining[split_idx..];
-    
+
     // Subsequent rows get full width
     for _ in 1..INPUT_ROWS {
         if remaining.is_empty() {
@@ -779,17 +847,17 @@ pub fn redraw_input(client_name: &str, buffer: &str, cursor_pos: usize, width: u
             remaining = &remaining[split_idx..];
         }
     }
-    
+
     // Draw each input row
     for (i, content) in row_contents.iter().enumerate() {
         let row = INPUT_ROW_START + i;
-        
+
         // Move to row, draw left border
         output.push_str(&esc::cursor_to(row, 1));
         output.push_str(ENTER_DEC_GRAPHICS);
         output.push(VerticalLine.as_dec_char());
         output.push_str(EXIT_DEC_GRAPHICS);
-        
+
         // First row has prompt
         if i == 0 {
             output.push_str(&prompt);
@@ -807,14 +875,14 @@ pub fn redraw_input(client_name: &str, buffer: &str, cursor_pos: usize, width: u
                 output.push(' ');
             }
         }
-        
+
         // Draw right border
         output.push(' ');
         output.push_str(ENTER_DEC_GRAPHICS);
         output.push(VerticalLine.as_dec_char());
         output.push_str(EXIT_DEC_GRAPHICS);
     }
-    
+
     // Calculate cursor position
     // cursor_pos is index in buffer (0 to buffer.len())
     let (cursor_row, cursor_col) = if cursor_pos <= first_row_capacity {
@@ -834,9 +902,9 @@ pub fn redraw_input(client_name: &str, buffer: &str, cursor_pos: usize, width: u
 
         (INPUT_ROW_START + row_index, 2 + col_in_row)
     };
-    
+
     output.push_str(&esc::cursor_to(cursor_row, cursor_col));
-    
+
     output
 }
 
@@ -845,7 +913,7 @@ pub fn cleanup_split_screen(width: usize) -> String {
     let mut output = String::new();
     output.push_str(&esc::reset_scroll_region());
     output.push_str(esc::CLEAR_SCREEN);
-    
+
     let sad_mac = [
         " .-------. ",
         " | X   X | ",
@@ -854,28 +922,28 @@ pub fn cleanup_split_screen(width: usize) -> String {
         " | /   \\ | ",
         " '-------' ",
     ];
-    
+
     let messages = [
         "Wormhole server is not running.",
-        "Please check logs or restart the device."
+        "Please check logs or restart the device.",
     ];
-    
+
     let total_lines = sad_mac.len() + 2 + messages.len(); // +2 for spacing
     let start_row = (TERMINAL_HEIGHT - total_lines) / 2;
-    
+
     for (i, line) in sad_mac.iter().enumerate() {
         let padding = (width - line.len()) / 2;
         output.push_str(&esc::cursor_to(start_row + i, padding + 1));
         output.push_str(line);
     }
-    
+
     let text_start_row = start_row + sad_mac.len() + 2;
     for (i, line) in messages.iter().enumerate() {
         let padding = (width - line.len()) / 2;
         output.push_str(&esc::cursor_to(text_start_row + i, padding + 1));
         output.push_str(line);
     }
-    
+
     // Move cursor to bottom to be clean
     output.push_str(&esc::cursor_to(TERMINAL_HEIGHT, 1));
     output
@@ -898,11 +966,14 @@ pub fn generate_waiting_for_peer_frame(peer_name: &str) -> Vec<String> {
     ];
 
     let max_width = raw_lines.iter().map(|l| l.len()).max().unwrap_or(0);
-    
-    raw_lines.into_iter().map(|line| {
-        let padding = max_width.saturating_sub(line.len());
-        let left = padding / 2;
-        let right = padding - left;
-        format!("{}{}{}", " ".repeat(left), line, " ".repeat(right))
-    }).collect()
+
+    raw_lines
+        .into_iter()
+        .map(|line| {
+            let padding = max_width.saturating_sub(line.len());
+            let left = padding / 2;
+            let right = padding - left;
+            format!("{}{}{}", " ".repeat(left), line, " ".repeat(right))
+        })
+        .collect()
 }

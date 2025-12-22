@@ -49,7 +49,7 @@ impl Serial {
     pub fn reconnect(&mut self) -> Result<(), SerialError> {
         // Close existing port if any
         self.port = None;
-        
+
         // Try to reopen
         let port = Self::open_port(&self.config)?;
         self.port = Some(port);
@@ -64,8 +64,9 @@ impl Serial {
     /// Clear the input buffer
     pub fn clear_input(&mut self) -> Result<(), SerialError> {
         match self.port.as_mut() {
-            Some(port) => port.clear(serialport::ClearBuffer::Input)
-                .map_err(|e| SerialError::Read(io::Error::new(io::ErrorKind::Other, e))),
+            Some(port) => port
+                .clear(serialport::ClearBuffer::Input)
+                .map_err(|e| SerialError::Read(io::Error::other(e))),
             None => Ok(()),
         }
     }
@@ -81,22 +82,22 @@ impl Serial {
     /// Read available bytes from the serial port (non-blocking style with timeout)
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, SerialError> {
         let port = self.port.as_mut().ok_or(SerialError::Disconnected)?;
-        
+
         // Check if any bytes are available before blocking on read
         // This prevents busy-looping on PTYs that return immediately
         match port.bytes_to_read() {
             Ok(0) => return Ok(0), // No data available, don't block
-            Ok(_) => {} // Data available, proceed to read
-            Err(_) => {} // Can't check, fall through to read with timeout
+            Ok(_) => {}            // Data available, proceed to read
+            Err(_) => {}           // Can't check, fall through to read with timeout
         }
-        
+
         match port.read(buf) {
             Ok(n) => Ok(n),
             Err(e) if e.kind() == io::ErrorKind::TimedOut => Ok(0),
             Err(e) => Err(SerialError::Read(e)),
         }
     }
-    
+
     /// Get the port path
     pub fn port_path(&self) -> &str {
         &self.config.port
@@ -107,14 +108,20 @@ impl Write for Serial {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self.port.as_mut() {
             Some(port) => port.write(buf),
-            None => Err(io::Error::new(io::ErrorKind::NotConnected, "serial port disconnected")),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "serial port disconnected",
+            )),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match self.port.as_mut() {
             Some(port) => port.flush(),
-            None => Err(io::Error::new(io::ErrorKind::NotConnected, "serial port disconnected")),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "serial port disconnected",
+            )),
         }
     }
 }
@@ -123,7 +130,10 @@ impl Read for Serial {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self.port.as_mut() {
             Some(port) => port.read(buf),
-            None => Err(io::Error::new(io::ErrorKind::NotConnected, "serial port disconnected")),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "serial port disconnected",
+            )),
         }
     }
 }
@@ -139,8 +149,7 @@ pub enum SerialError {
     Disconnected,
 }
 
-impl SerialError {
-}
+impl SerialError {}
 
 impl std::fmt::Display for SerialError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

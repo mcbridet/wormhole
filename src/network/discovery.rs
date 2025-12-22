@@ -22,10 +22,7 @@ const MAGIC: &[u8; 8] = b"ACMSWRMH";
 #[derive(Debug, Clone)]
 pub enum DiscoveryMessage {
     /// Announce presence on the network
-    Announce {
-        name: String,
-        port: u16,
-    },
+    Announce { name: String, port: u16 },
     /// Request all peers to announce themselves
     Query,
 }
@@ -94,8 +91,6 @@ impl Discovery {
         // Bind to the discovery port with SO_REUSEADDR and SO_REUSEPORT
         // This allows multiple processes on the same machine to share the port
         let socket = {
-            
-            
             // Create socket with socket2 for better control
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DISCOVERY_PORT);
             let socket2 = socket2::Socket::new(
@@ -104,11 +99,12 @@ impl Discovery {
                 Some(socket2::Protocol::UDP),
             )
             .map_err(|e| super::NetworkError::Bind(format!("Socket creation failed: {}", e)))?;
-            
+
             // Set SO_REUSEADDR
-            socket2.set_reuse_address(true)
+            socket2
+                .set_reuse_address(true)
                 .map_err(|e| super::NetworkError::Bind(format!("SO_REUSEADDR failed: {}", e)))?;
-            
+
             // Set SO_REUSEPORT using libc directly (socket2 may not expose it)
             #[cfg(unix)]
             {
@@ -131,23 +127,27 @@ impl Discovery {
                     )));
                 }
             }
-            
+
             // Set broadcast
-            socket2.set_broadcast(true)
+            socket2
+                .set_broadcast(true)
                 .map_err(|e| super::NetworkError::Bind(format!("SO_BROADCAST failed: {}", e)))?;
-            
+
             // Bind to the discovery port
-            socket2.bind(&addr.into())
+            socket2
+                .bind(&addr.into())
                 .map_err(|e| super::NetworkError::Bind(format!("Discovery bind failed: {}", e)))?;
-            
+
             // Set non-blocking for async
-            socket2.set_nonblocking(true)
+            socket2
+                .set_nonblocking(true)
                 .map_err(|e| super::NetworkError::Bind(format!("Non-blocking failed: {}", e)))?;
-            
+
             // Convert to tokio socket
             let std_socket: std::net::UdpSocket = socket2.into();
-            tokio::net::UdpSocket::from_std(std_socket)
-                .map_err(|e| super::NetworkError::Bind(format!("Tokio socket conversion failed: {}", e)))?
+            tokio::net::UdpSocket::from_std(std_socket).map_err(|e| {
+                super::NetworkError::Bind(format!("Tokio socket conversion failed: {}", e))
+            })?
         };
 
         Ok(Self {

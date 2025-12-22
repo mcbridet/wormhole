@@ -111,7 +111,7 @@ where
     D: serde::Deserializer<'de>,
 {
     use serde::de::Error;
-    
+
     let s = String::deserialize(deserializer)?;
     match s.to_lowercase().as_str() {
         "true" | "1" | "yes" | "on" => Ok(true),
@@ -177,10 +177,20 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConfigError::Io { path, source } => {
-                write!(f, "failed to read config file '{}': {}", path.display(), source)
+                write!(
+                    f,
+                    "failed to read config file '{}': {}",
+                    path.display(),
+                    source
+                )
             }
             ConfigError::Parse { path, source } => {
-                write!(f, "failed to parse config file '{}': {}", path.display(), source)
+                write!(
+                    f,
+                    "failed to parse config file '{}': {}",
+                    path.display(),
+                    source
+                )
             }
         }
     }

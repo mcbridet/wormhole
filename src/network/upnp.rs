@@ -12,9 +12,9 @@ pub fn setup_port_forward(
 ) -> Result<SocketAddrV4, super::NetworkError> {
     // Get our local IP - use configured or auto-detect
     let local_ip = match bind_ip {
-        Some(ip_str) => ip_str
-            .parse::<Ipv4Addr>()
-            .map_err(|e| super::NetworkError::Upnp(format!("Invalid bind_ip '{}': {}", ip_str, e)))?,
+        Some(ip_str) => ip_str.parse::<Ipv4Addr>().map_err(|e| {
+            super::NetworkError::Upnp(format!("Invalid bind_ip '{}': {}", ip_str, e))
+        })?,
         None => get_local_ip()?,
     };
     eprintln!("  Local IP: {}", local_ip);
@@ -37,7 +37,10 @@ pub fn setup_port_forward(
     // We use a reasonable lease time instead
     let lease_duration = 3600; // 1 hour
 
-    eprintln!("  Requesting port mapping: {} -> {}:{}", external_port, local_ip, local_port);
+    eprintln!(
+        "  Requesting port mapping: {} -> {}:{}",
+        external_port, local_ip, local_port
+    );
     gateway
         .add_port(
             igd_next::PortMappingProtocol::UDP,

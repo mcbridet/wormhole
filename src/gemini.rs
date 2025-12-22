@@ -49,7 +49,11 @@ impl GeminiChat {
     /// Create a new Gemini chat session from config
     /// `terminal_width` is the number of columns available for output
     /// `terminal_mode` is the terminal type (e.g., "vt100" or "vt220")
-    pub fn new(config: &GeminiConfig, terminal_width: usize, terminal_mode: &str) -> Result<Self, GeminiError> {
+    pub fn new(
+        config: &GeminiConfig,
+        terminal_width: usize,
+        terminal_mode: &str,
+    ) -> Result<Self, GeminiError> {
         let api_key = config.api_key.as_ref().ok_or(GeminiError::NoApiKey)?;
 
         // Parse model string to Model enum and create client with that model
