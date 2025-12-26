@@ -104,16 +104,3 @@ fn try_stun_server(socket: &UdpSocket, server: &str) -> Result<SocketAddr, super
         "No mapped address in response".to_string(),
     ))
 }
-
-#[cfg(test)]
-mod tests {
-    // STUN tests require network access, so they're ignored by default
-    #[test]
-    #[ignore]
-    fn test_stun_discovery() {
-        let result = super::discover_public_endpoint(0);
-        assert!(result.is_ok(), "STUN discovery failed: {:?}", result);
-        let addr = result.unwrap();
-        println!("Discovered public endpoint: {}", addr);
-    }
-}

@@ -356,3 +356,74 @@ impl ChatBuffer {
         output
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_visible_len() {
+        assert_eq!(visible_len("hello"), 5);
+        assert_eq!(visible_len("hello world"), 11);
+        // Shift in/out characters should not count
+        assert_eq!(visible_len("a\x0Eb\x0Fc"), 3);
+    }
+
+    #[test]
+    fn test_new_buffer() {
+        let buf = ChatBuffer::new(80);
+        assert!(!buf.is_full());
+        assert_eq!(buf.visible_lines().len(), 0);
+    }
+
+    #[test]
+    fn test_push_simple() {
+        let mut buf = ChatBuffer::new(80);
+        buf.push("Hello, world!".to_string());
+        assert_eq!(buf.visible_lines(), vec!["Hello, world!"]);
+    }
+
+    #[test]
+    fn test_push_wrapping() {
+        let mut buf = ChatBuffer::new(20); // Very narrow, max_len = 16
+        buf.push("This is a long message that should wrap".to_string());
+        let lines = buf.visible_lines();
+        assert!(lines.len() > 1, "Message should wrap to multiple lines");
+        // Each line should be at most max_len (width - 4 = 16)
+        for line in &lines {
+            assert!(line.len() <= 16, "Line too long: {}", line);
+        }
+    }
+
+    #[test]
+    fn test_scroll() {
+        let mut buf = ChatBuffer::new(80);
+        // Push more lines than visible area
+        for i in 0..30 {
+            buf.push(format!("Line {}", i));
+        }
+
+        // Should start at bottom
+        let visible = buf.visible_lines();
+        assert!(visible.last().unwrap().contains("29"));
+
+        // Scroll up
+        buf.scroll_up(5);
+        let visible = buf.visible_lines();
+        assert!(!visible.last().unwrap().contains("29"));
+
+        // Scroll back to bottom
+        buf.scroll_to_bottom();
+        let visible = buf.visible_lines();
+        assert!(visible.last().unwrap().contains("29"));
+    }
+
+    #[test]
+    fn test_clear() {
+        let mut buf = ChatBuffer::new(80);
+        buf.push("Test message".to_string());
+        assert!(!buf.visible_lines().is_empty());
+        buf.clear();
+        assert!(buf.visible_lines().is_empty());
+    }
+}

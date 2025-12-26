@@ -7,6 +7,7 @@ mod log;
 mod network;
 mod serial;
 mod terminal;
+mod tunes;
 mod webcam;
 
 use app::App;
@@ -23,6 +24,7 @@ use terminal::{
     Tab, cleanup_split_screen, generate_waiting_for_peer_frame, init_split_screen_with_tabs,
     max_input_length, redraw_input, redraw_tab_bar, render_stream,
 };
+use webcam::{RawFrame, raw_frame_to_output};
 
 #[derive(Parser, Debug)]
 #[command(name = "wormhole")]
@@ -85,6 +87,9 @@ async fn main() {
         if config.webcam.fps > 0 {
             println!("  FPS: {}", config.webcam.fps);
         }
+        if config.terminal.mode == "vt340" {
+            println!("  Sixel Shades: {}", config.webcam.sixel_shades);
+        }
     } else {
         println!("  Device: (not configured)");
     }
@@ -101,9 +106,19 @@ async fn main() {
     println!();
     println!("Terminal:");
     println!("  Mode: {}", config.terminal.mode);
+    if config.terminal.cols_132 {
+        println!("  132 Columns: enabled");
+    }
     println!();
     println!("Logging:");
     if let Some(ref dir) = config.logging.directory {
+        println!("  Directory: {}", dir);
+    } else {
+        println!("  Directory: (not configured)");
+    }
+    println!();
+    println!("Tunes:");
+    if let Some(ref dir) = config.tunes.directory {
         println!("  Directory: {}", dir);
     } else {
         println!("  Directory: (not configured)");
@@ -129,7 +144,7 @@ async fn main() {
     };
 
     // Determine terminal width based on config
-    let use_132_cols = app.config.terminal.mode == "vt220";
+    let use_132_cols = app.config.terminal.cols_132;
     let width = if use_132_cols { 132 } else { 80 };
 
     // Main loop - handle serial I/O and network messages
@@ -156,6 +171,10 @@ async fn main() {
         .checked_sub(frame_delay)
         .unwrap_or_else(std::time::Instant::now);
 
+    // Tunes status refresh timer (1 second for MM:SS display)
+    let tunes_refresh_delay = Duration::from_secs(1);
+    let mut last_tunes_refresh = std::time::Instant::now();
+
     // Main loop uses tokio::time::sleep to yield properly to the async runtime
     let loop_delay = Duration::from_millis(1);
 
@@ -177,15 +196,18 @@ async fn main() {
                         let gemini_available = app.gemini_chat.is_some();
 
                         // Re-send DRCS init if needed
-                        let use_drcs = app.config.terminal.mode == "vt220";
+                        let use_drcs = app.config.terminal.mode == "vt220"
+                            || app.config.terminal.mode == "vt340";
                         let _ = app
                             .serial
                             .write_str(&terminal::get_init_sequence(use_drcs, use_132_cols));
 
+                        let tunes_available = app.tunes_available();
                         let _ = app.serial.write_str(&init_split_screen_with_tabs(
                             &app.config.network.name,
                             app.active_tab,
                             gemini_available,
+                            tunes_available,
                             app.active_call.as_deref(),
                             call_status.as_deref(),
                             width,
@@ -209,6 +231,11 @@ async fn main() {
                                     app.input_cursor,
                                     width,
                                 ));
+                            }
+                            Tab::Tunes => {
+                                if let Some(ref tunes) = app.tunes_state {
+                                    let _ = app.serial.write_str(&tunes.render());
+                                }
                             }
                             Tab::Call => {}
                         }
@@ -239,8 +266,25 @@ async fn main() {
                         }
                         app.chat_buffer.scroll_to_bottom();
                     }
-                    Message::StreamFrame { from, lines } => {
-                        app.current_stream_frame = Some((from, lines));
+                    Message::StreamFrame { from, .. } => {
+                        // Legacy: ignore pre-rendered StreamFrame from older peers
+                        // Peers should upgrade to use VideoFrame for cross-terminal compatibility
+                        eprintln!("Received legacy StreamFrame from {} (ignored)", from);
+                    }
+                    Message::VideoFrame {
+                        from,
+                        width,
+                        height,
+                        pixels,
+                    } => {
+                        app.current_video_frame = Some((
+                            from,
+                            RawFrame {
+                                width,
+                                height,
+                                pixels,
+                            },
+                        ));
                     }
                     _ => {}
                 }
@@ -281,47 +325,54 @@ async fn main() {
                 Duration::from_secs(30)
             };
 
-            if last_packet.elapsed() > timeout
-                && let Some(peer_name) = app.active_call.take()
-            {
-                let timestamp = Local::now().format("%I:%M%p");
-                app.push_chat(format!(
-                    "[{}] *** Call with {} timed out ***",
-                    timestamp, peer_name
-                ));
-                app.last_rendered_frame = None;
-                app.call_last_packet = None;
-                app.call_connected = false;
+            if last_packet.elapsed() > timeout {
+                // Don't timeout self-calls
+                let is_self_call = app.active_call.as_deref() == Some(&app.config.network.name);
 
-                // Redraw UI if needed
-                if app.active_tab == Tab::Call {
-                    // Switch back to Chat
-                    app.active_tab = Tab::Chat;
-                    let gemini_available = app.gemini_chat.is_some();
-                    let _ = app.serial.write_str(&init_split_screen_with_tabs(
-                        &app.config.network.name,
-                        app.active_tab,
-                        gemini_available,
-                        app.active_call.as_deref(),
-                        None,
-                        width,
+                if !is_self_call && let Some(peer_name) = app.active_call.take() {
+                    let timestamp = Local::now().format("%I:%M%p");
+                    app.push_chat(format!(
+                        "[{}] *** Call with {} timed out ***",
+                        timestamp, peer_name
                     ));
-                    let _ = app.serial.write_str(&app.chat_buffer.render());
-                    let _ = app.serial.write_str(&redraw_input(
-                        &app.config.network.name,
-                        &app.line_buffer,
-                        app.input_cursor,
-                        width,
-                    ));
-                } else {
-                    // Just update the tab bar
-                    let gemini_available = app.gemini_chat.is_some();
-                    let _ = app.serial.write_str(&redraw_tab_bar(
-                        app.active_tab,
-                        gemini_available,
-                        app.active_call.as_deref(),
-                        width,
-                    ));
+                    app.last_rendered_frame = None;
+                    app.call_last_packet = None;
+                    app.call_connected = false;
+
+                    // Redraw UI if needed
+                    if app.active_tab == Tab::Call {
+                        // Switch back to Chat
+                        app.active_tab = Tab::Chat;
+                        let gemini_available = app.gemini_chat.is_some();
+                        let tunes_available = app.tunes_available();
+                        let _ = app.serial.write_str(&init_split_screen_with_tabs(
+                            &app.config.network.name,
+                            app.active_tab,
+                            gemini_available,
+                            tunes_available,
+                            app.active_call.as_deref(),
+                            None,
+                            width,
+                        ));
+                        let _ = app.serial.write_str(&app.chat_buffer.render());
+                        let _ = app.serial.write_str(&redraw_input(
+                            &app.config.network.name,
+                            &app.line_buffer,
+                            app.input_cursor,
+                            width,
+                        ));
+                    } else {
+                        // Just update the tab bar
+                        let gemini_available = app.gemini_chat.is_some();
+                        let tunes_available = app.tunes_available();
+                        let _ = app.serial.write_str(&redraw_tab_bar(
+                            app.active_tab,
+                            gemini_available,
+                            tunes_available,
+                            app.active_call.as_deref(),
+                            width,
+                        ));
+                    }
                 }
             }
         }
@@ -347,17 +398,30 @@ async fn main() {
 
         // Check for discovered peers
         while let Ok(peer) = app.discovery_rx.try_recv() {
-            // Skip if we already know this peer and they haven't timed out
+            // Check if this is a peer we already know and is still active
             if app.net_node.has_peer(peer.addr, PEER_TIMEOUT) {
                 // Update last_seen for active peers
                 app.net_node.touch_peer(peer.addr);
                 continue;
             }
-            eprintln!("Discovered peer: {} at {}", peer.name, peer.addr);
-            // Add peer and send join message (notification shown when we receive their Join reply)
+
+            // Skip peers who recently sent a Leave message (grace period)
+            if app.net_node.recently_left(peer.addr) {
+                continue;
+            }
+
+            // Check if this is a peer we've seen before (reconnecting)
+            let is_reconnect = app.net_node.knows_peer(peer.addr);
+
+            // Add peer and send join message
             if let Err(e) = app.net_node.connect_to_peer(peer.addr).await {
-                eprintln!("Failed to connect to discovered peer: {}", e);
+                eprintln!("Failed to connect to peer: {}", e);
             } else {
+                if is_reconnect {
+                    eprintln!("Peer reconnected: {} at {}", peer.name, peer.addr);
+                } else {
+                    eprintln!("Discovered peer: {} at {}", peer.name, peer.addr);
+                }
                 app.net_node.add_peer(peer.name.clone(), peer.addr);
             }
         }
@@ -370,6 +434,7 @@ async fn main() {
                 let from_peer = match &msg {
                     Message::Chat { from, .. } => Some(from),
                     Message::StreamFrame { from, .. } => Some(from),
+                    Message::VideoFrame { from, .. } => Some(from),
                     Message::CallRequest { from } => Some(from),
                     Message::CallHangup { from } => Some(from),
                     _ => None,
@@ -386,6 +451,12 @@ async fn main() {
             match msg {
                 Message::Chat { from, text } => {
                     let timestamp = Local::now().format("%I:%M%p");
+
+                    // Check if our name is mentioned in the message (case-insensitive)
+                    let my_name = &app.config.network.name;
+                    if from != *my_name && text.to_lowercase().contains(&my_name.to_lowercase()) {
+                        let _ = app.serial.write_str("\x07");
+                    }
 
                     // Check if this is an image message
                     if text.starts_with("[IMAGE]\n") {
@@ -466,18 +537,20 @@ async fn main() {
                         app.call_connected = false;
 
                         // Stop webcam
-                        if let Some(cam) = &mut app.webcam {
-                            let _ = cam.stop();
+                        if let Some(cam) = &app.webcam {
+                            cam.stop().await;
                         }
 
                         // Switch back to Chat
                         if app.active_tab == Tab::Call {
                             app.active_tab = Tab::Chat;
                             let gemini_available = app.gemini_chat.is_some();
+                            let tunes_available = app.tunes_available();
                             let _ = app.serial.write_str(&init_split_screen_with_tabs(
                                 &app.config.network.name,
                                 app.active_tab,
                                 gemini_available,
+                                tunes_available,
                                 app.active_call.as_deref(),
                                 None,
                                 width,
@@ -492,9 +565,11 @@ async fn main() {
                         } else {
                             // Just update the tab bar
                             let gemini_available = app.gemini_chat.is_some();
+                            let tunes_available = app.tunes_available();
                             let _ = app.serial.write_str(&redraw_tab_bar(
                                 app.active_tab,
                                 gemini_available,
+                                tunes_available,
                                 app.active_call.as_deref(),
                                 width,
                             ));
@@ -518,18 +593,20 @@ async fn main() {
                         app.call_connected = false;
 
                         // Stop webcam
-                        if let Some(cam) = &mut app.webcam {
-                            let _ = cam.stop();
+                        if let Some(cam) = &app.webcam {
+                            cam.stop().await;
                         }
 
                         // If we were in the Call tab, switch back to Chat
                         if app.active_tab == Tab::Call {
                             app.active_tab = Tab::Chat;
                             let gemini_available = app.gemini_chat.is_some();
+                            let tunes_available = app.tunes_available();
                             let _ = app.serial.write_str(&init_split_screen_with_tabs(
                                 &app.config.network.name,
                                 app.active_tab,
                                 gemini_available,
+                                tunes_available,
                                 app.active_call.as_deref(),
                                 None,
                                 width,
@@ -544,17 +621,35 @@ async fn main() {
                         } else {
                             // Just update the tab bar
                             let gemini_available = app.gemini_chat.is_some();
+                            let tunes_available = app.tunes_available();
                             let _ = app.serial.write_str(&redraw_tab_bar(
                                 app.active_tab,
                                 gemini_available,
+                                tunes_available,
                                 app.active_call.as_deref(),
                                 width,
                             ));
                         }
                     }
                 }
-                Message::StreamFrame { from, lines } => {
-                    app.current_stream_frame = Some((from, lines));
+                Message::StreamFrame { from, .. } => {
+                    // Legacy: ignore pre-rendered StreamFrame from older peers
+                    eprintln!("Received legacy StreamFrame from {} (ignored)", from);
+                }
+                Message::VideoFrame {
+                    from,
+                    width: w,
+                    height: h,
+                    pixels,
+                } => {
+                    app.current_video_frame = Some((
+                        from,
+                        RawFrame {
+                            width: w,
+                            height: h,
+                            pixels,
+                        },
+                    ));
                 }
                 _ => {}
             }
@@ -574,16 +669,21 @@ async fn main() {
             && last_frame_time.elapsed() >= frame_delay
         {
             last_frame_time = std::time::Instant::now();
-            let mut frame_to_render = None;
+            let mut frame_to_render: Option<Vec<String>> = None;
             let mut sender_name = String::new();
 
+            // Get render mode for local display
+            let render_mode = webcam::RenderMode::from_terminal_mode(
+                &app.config.terminal.mode,
+                app.config.webcam.sixel_shades,
+            );
+
             // Try to capture from webcam if available
-            let mut local_frame = None;
-            if let Some(cam) = &mut app.webcam {
-                let use_drcs = app.config.terminal.mode == "vt220";
-                match cam.capture_frame(use_drcs, width) {
-                    Ok(lines) => {
-                        local_frame = Some(lines.clone());
+            let mut local_raw_frame: Option<RawFrame> = None;
+            if let Some(cam) = &app.webcam {
+                match cam.capture_raw_frame(width).await {
+                    Ok(raw_frame) => {
+                        local_raw_frame = Some(raw_frame.clone());
 
                         // Only transmit if we are in a call with a remote peer
                         if let Some(target_name) = &app.active_call
@@ -598,15 +698,18 @@ async fn main() {
                                 .map(|p| p.addr);
 
                             if let Some(addr) = target_addr {
-                                let msg = Message::StreamFrame {
+                                // Send raw frame data - receiver will render according to their terminal
+                                let msg = Message::VideoFrame {
                                     from: app.config.network.name.clone(),
-                                    lines,
+                                    width: raw_frame.width,
+                                    height: raw_frame.height,
+                                    pixels: raw_frame.pixels,
                                 };
 
                                 if let Err(e) =
                                     futures::executor::block_on(app.net_node.send_to(&msg, addr))
                                 {
-                                    eprintln!("Failed to send stream frame: {}", e);
+                                    eprintln!("Failed to send video frame: {}", e);
                                 }
                             }
                         }
@@ -622,18 +725,29 @@ async fn main() {
                 // Determine what to render
                 // 1. If we are calling someone, try to show their video
                 if let Some(peer_name) = &app.active_call {
-                    if let Some((from, lines)) = &app.current_stream_frame
+                    if let Some((from, raw_frame)) = &app.current_video_frame
                         && from == peer_name
                     {
-                        frame_to_render = Some(lines.clone());
+                        // Render received raw frame according to OUR terminal mode
+                        let lines = raw_frame_to_output(
+                            raw_frame,
+                            render_mode,
+                            app.config.webcam.sixel_shades,
+                        );
+                        frame_to_render = Some(lines);
                         sender_name = from.clone();
                     }
 
                     // 2. If we haven't found their video yet, and we are calling "yourself", show local video
                     if frame_to_render.is_none()
                         && peer_name == &app.config.network.name
-                        && let Some(lines) = local_frame.clone()
+                        && let Some(raw_frame) = &local_raw_frame
                     {
+                        let lines = raw_frame_to_output(
+                            raw_frame,
+                            render_mode,
+                            app.config.webcam.sixel_shades,
+                        );
                         frame_to_render = Some(lines);
                         sender_name = app.config.network.name.clone();
                     }
@@ -649,12 +763,22 @@ async fn main() {
                 //    ONLY if we are NOT in a call with someone else (to avoid showing self when waiting for peer)
                 //    OR if we have received a frame from someone else (passive watching)
                 if frame_to_render.is_none() {
-                    if let Some((from, lines)) = &app.current_stream_frame {
-                        frame_to_render = Some(lines.clone());
+                    if let Some((from, raw_frame)) = &app.current_video_frame {
+                        let lines = raw_frame_to_output(
+                            raw_frame,
+                            render_mode,
+                            app.config.webcam.sixel_shades,
+                        );
+                        frame_to_render = Some(lines);
                         sender_name = from.clone();
                     } else if app.active_call.is_none() {
                         // Only show mirror if not in a call
-                        if let Some(lines) = local_frame {
+                        if let Some(raw_frame) = &local_raw_frame {
+                            let lines = raw_frame_to_output(
+                                raw_frame,
+                                render_mode,
+                                app.config.webcam.sixel_shades,
+                            );
                             frame_to_render = Some(lines);
                             sender_name = app.config.network.name.clone();
                         }
@@ -663,19 +787,20 @@ async fn main() {
 
                 // Render if we have a frame
                 if let Some(lines) = frame_to_render {
-                    let rendered = render_stream(
+                    let (rendered, frame) = render_stream(
                         &sender_name,
                         &lines,
                         app.last_rendered_frame.as_ref(),
                         width,
                     );
+                    // Update stats with actual bytes sent (factors in differential rendering savings)
                     app.stats_bytes_sent += rendered.len();
                     app.stats_frames_rendered += 1;
 
                     if let Err(e) = app.serial.write_str(&rendered) {
                         eprintln!("Serial write error in Call tab: {}", e);
                     }
-                    app.last_rendered_frame = Some(lines);
+                    app.last_rendered_frame = Some(frame);
                 }
             }
 
@@ -693,6 +818,16 @@ async fn main() {
             }
         }
 
+        // Refresh tunes status display periodically when playing
+        if app.active_tab == Tab::Tunes
+            && last_tunes_refresh.elapsed() >= tunes_refresh_delay
+            && let Some(ref tunes) = app.tunes_state
+            && tunes.is_active()
+        {
+            last_tunes_refresh = std::time::Instant::now();
+            let _ = app.serial.write_str(&tunes.render());
+        }
+
         // Check for serial input
         match app.serial.read(&mut serial_buf) {
             Ok(0) => {
@@ -706,28 +841,47 @@ async fn main() {
                         if let Some(seq) = escape_parser.feed(byte) {
                             match seq {
                                 EscapeSequence::PageUp => {
-                                    // Page Up - scroll up (on active buffer)
-                                    let active_buffer = if app.active_tab == Tab::Chat {
-                                        &mut app.chat_buffer
+                                    // Page Up - scroll up (on active buffer) or page up in tunes
+                                    if app.active_tab == Tab::Tunes {
+                                        if let Some(ref mut tunes) = app.tunes_state {
+                                            tunes.page_up();
+                                            let _ = app.serial.write_str(&tunes.render());
+                                        }
                                     } else {
-                                        &mut app.ai_buffer
-                                    };
-                                    active_buffer.scroll_up(10);
-                                    let _ = app.serial.write_str(&active_buffer.render());
+                                        let active_buffer = if app.active_tab == Tab::Chat {
+                                            &mut app.chat_buffer
+                                        } else {
+                                            &mut app.ai_buffer
+                                        };
+                                        active_buffer.scroll_up(10);
+                                        let _ = app.serial.write_str(&active_buffer.render());
+                                    }
                                 }
                                 EscapeSequence::PageDown => {
-                                    // Page Down - scroll down (on active buffer)
-                                    let active_buffer = if app.active_tab == Tab::Chat {
-                                        &mut app.chat_buffer
+                                    // Page Down - scroll down (on active buffer) or page down in tunes
+                                    if app.active_tab == Tab::Tunes {
+                                        if let Some(ref mut tunes) = app.tunes_state {
+                                            tunes.page_down();
+                                            let _ = app.serial.write_str(&tunes.render());
+                                        }
                                     } else {
-                                        &mut app.ai_buffer
-                                    };
-                                    active_buffer.scroll_down(10);
-                                    let _ = app.serial.write_str(&active_buffer.render());
+                                        let active_buffer = if app.active_tab == Tab::Chat {
+                                            &mut app.chat_buffer
+                                        } else {
+                                            &mut app.ai_buffer
+                                        };
+                                        active_buffer.scroll_down(10);
+                                        let _ = app.serial.write_str(&active_buffer.render());
+                                    }
                                 }
                                 EscapeSequence::ArrowUp => {
-                                    // Up Arrow - History Previous
-                                    if app.active_tab != Tab::Call
+                                    // Up Arrow - navigate tunes or history previous
+                                    if app.active_tab == Tab::Tunes {
+                                        if let Some(ref mut tunes) = app.tunes_state {
+                                            tunes.move_up();
+                                            let _ = app.serial.write_str(&tunes.render());
+                                        }
+                                    } else if app.active_tab != Tab::Call
                                         && !app.ai_processing
                                         && !app.input_history.is_empty()
                                     {
@@ -754,8 +908,13 @@ async fn main() {
                                     }
                                 }
                                 EscapeSequence::ArrowDown => {
-                                    // Down Arrow - History Next
-                                    if app.active_tab != Tab::Call
+                                    // Down Arrow - navigate tunes or history next
+                                    if app.active_tab == Tab::Tunes {
+                                        if let Some(ref mut tunes) = app.tunes_state {
+                                            tunes.move_down();
+                                            let _ = app.serial.write_str(&tunes.render());
+                                        }
+                                    } else if app.active_tab != Tab::Call
                                         && !app.ai_processing
                                         && let Some(i) = app.history_index
                                     {
@@ -826,6 +985,23 @@ async fn main() {
                             if app.ai_processing {
                                 continue;
                             }
+
+                            // Handle Enter for tabs that don't use line buffer
+                            if app.active_tab == Tab::Tunes {
+                                if let Some(ref mut tunes) = app.tunes_state {
+                                    if let Err(e) = tunes.play_selected() {
+                                        eprintln!("Failed to play: {}", e);
+                                    }
+                                    let _ = app.serial.write_str(&tunes.render());
+                                }
+                                continue;
+                            }
+
+                            if app.active_tab == Tab::Call {
+                                // Call tab has no Enter action
+                                continue;
+                            }
+
                             if !app.line_buffer.is_empty() {
                                 let text = app.line_buffer.clone();
 
@@ -852,9 +1028,6 @@ async fn main() {
 
                                 // Handle input based on active tab
                                 match app.active_tab {
-                                    Tab::Call => {
-                                        // No input handling for Call tab
-                                    }
                                     Tab::Chat => {
                                         // P2P Chat tab - handle commands and messages
                                         if text.starts_with('/') {
@@ -884,13 +1057,36 @@ async fn main() {
                                                         // Capture webcam snapshot
                                                         let timestamp =
                                                             Local::now().format("%I:%M%p");
-                                                        let use_drcs =
-                                                            app.config.terminal.mode == "vt220";
-                                                        match webcam::capture_ascii_snapshot(
-                                                            app.config.webcam.device.as_deref(),
-                                                            use_drcs,
-                                                            width,
-                                                        ) {
+                                                        let render_mode =
+                                                            webcam::RenderMode::from_terminal_mode(
+                                                                &app.config.terminal.mode,
+                                                                app.config.webcam.sixel_shades,
+                                                            );
+
+                                                        let result = if let Some(cam) = &app.webcam
+                                                        {
+                                                            if let Some(device) =
+                                                                &app.config.webcam.device
+                                                            {
+                                                                cam.take_snapshot(
+                                                                    device.clone(),
+                                                                    render_mode,
+                                                                    width,
+                                                                )
+                                                                .await
+                                                            } else {
+                                                                Err(webcam::WebcamError::NotConfigured)
+                                                            }
+                                                        } else {
+                                                            // Fallback if app.webcam is None (e.g. initialization failed or not configured)
+                                                            webcam::capture_ascii_snapshot(
+                                                                app.config.webcam.device.as_deref(),
+                                                                render_mode,
+                                                                width,
+                                                            )
+                                                        };
+
+                                                        match result {
                                                             Ok(lines) => {
                                                                 // Add header
                                                                 app.push_chat(format!(
@@ -986,11 +1182,9 @@ async fn main() {
                                                             .write_str(&app.chat_buffer.render());
                                                     }
                                                     _ => {
-                                                        if text.starts_with("/call ") {
-                                                            let peer_name = text
-                                                                .strip_prefix("/call ")
-                                                                .unwrap_or("")
-                                                                .trim();
+                                                        if text.to_lowercase().starts_with("/call ")
+                                                        {
+                                                            let peer_name = text[6..].trim();
                                                             if !peer_name.is_empty() {
                                                                 // Check if peer exists (or is self)
                                                                 let peer_exists = peer_name
@@ -1037,10 +1231,8 @@ async fn main() {
                                                                     app.last_rendered_frame = None;
 
                                                                     // Start webcam
-                                                                    if let Some(cam) =
-                                                                        &mut app.webcam
-                                                                    {
-                                                                        let _ = cam.start();
+                                                                    if let Some(cam) = &app.webcam {
+                                                                        cam.start().await;
                                                                     }
 
                                                                     // Redraw UI
@@ -1050,7 +1242,9 @@ async fn main() {
                                                                     );
                                                                     let gemini_available =
                                                                         app.gemini_chat.is_some();
-                                                                    let _ = app.serial.write_str(&init_split_screen_with_tabs(&app.config.network.name, app.active_tab, gemini_available, app.active_call.as_deref(), Some(&status), width));
+                                                                    let tunes_available =
+                                                                        app.tunes_available();
+                                                                    let _ = app.serial.write_str(&init_split_screen_with_tabs(&app.config.network.name, app.active_tab, gemini_available, tunes_available, app.active_call.as_deref(), Some(&status), width));
                                                                 } else {
                                                                     let timestamp = Local::now()
                                                                         .format("%I:%M%p");
@@ -1365,6 +1559,8 @@ async fn main() {
                                             }
                                         }
                                     }
+                                    // Call and Tunes are handled before the line buffer check
+                                    Tab::Call | Tab::Tunes => unreachable!(),
                                 }
                             }
                         }
@@ -1374,6 +1570,7 @@ async fn main() {
                                 continue;
                             }
                             if app.active_tab != Tab::Call
+                                && app.active_tab != Tab::Tunes
                                 && !app.line_buffer.is_empty()
                                 && app.input_cursor > 0
                             {
@@ -1417,25 +1614,35 @@ async fn main() {
                                 Tab::Call => {
                                     // Do nothing for Call tab
                                 }
+                                Tab::Tunes => {
+                                    // Ctrl+C in Tunes - stop playback
+                                    if let Some(ref tunes) = app.tunes_state {
+                                        tunes.stop();
+                                        let _ = app.serial.write_str(&tunes.render());
+                                    }
+                                }
                             }
                         }
                         InputEvent::Tab => {
                             // Tab key - switch tabs
                             let prev_tab = app.active_tab;
                             let gemini_available = app.gemini_chat.is_some();
-                            app.active_tab = app
-                                .active_tab
-                                .next(gemini_available, app.active_call.is_some());
+                            let tunes_available = app.tunes_available();
+                            app.active_tab = app.active_tab.next(
+                                gemini_available,
+                                app.active_call.is_some(),
+                                tunes_available,
+                            );
 
                             // Reset video state when switching tabs
                             app.last_rendered_frame = None;
 
                             // Handle webcam state
-                            if let Some(cam) = &mut app.webcam {
+                            if let Some(cam) = &app.webcam {
                                 if app.active_tab == Tab::Call {
-                                    let _ = cam.start();
+                                    cam.start().await;
                                 } else if prev_tab == Tab::Call && app.active_call.is_none() {
-                                    let _ = cam.stop();
+                                    cam.stop().await;
                                 }
                             }
 
@@ -1443,6 +1650,7 @@ async fn main() {
                             let _ = app.serial.write_str(&redraw_tab_bar(
                                 app.active_tab,
                                 gemini_available,
+                                tunes_available,
                                 app.active_call.as_deref(),
                                 width,
                             ));
@@ -1453,6 +1661,7 @@ async fn main() {
                                         &app.config.network.name,
                                         app.active_tab,
                                         gemini_available,
+                                        tunes_available,
                                         app.active_call.as_deref(),
                                         None,
                                         width,
@@ -1470,6 +1679,7 @@ async fn main() {
                                         &app.config.network.name,
                                         app.active_tab,
                                         gemini_available,
+                                        tunes_available,
                                         app.active_call.as_deref(),
                                         None,
                                         width,
@@ -1493,10 +1703,25 @@ async fn main() {
                                         &app.config.network.name,
                                         app.active_tab,
                                         gemini_available,
+                                        tunes_available,
                                         app.active_call.as_deref(),
                                         status.as_deref(),
                                         width,
                                     ));
+                                }
+                                Tab::Tunes => {
+                                    let _ = app.serial.write_str(&init_split_screen_with_tabs(
+                                        &app.config.network.name,
+                                        app.active_tab,
+                                        gemini_available,
+                                        tunes_available,
+                                        app.active_call.as_deref(),
+                                        None,
+                                        width,
+                                    ));
+                                    if let Some(ref tunes) = app.tunes_state {
+                                        let _ = app.serial.write_str(&tunes.render());
+                                    }
                                 }
                             }
                         }
@@ -1513,10 +1738,12 @@ async fn main() {
                                 None
                             };
                             let gemini_available = app.gemini_chat.is_some();
+                            let tunes_available = app.tunes_available();
                             let _ = app.serial.write_str(&init_split_screen_with_tabs(
                                 &app.config.network.name,
                                 app.active_tab,
                                 gemini_available,
+                                tunes_available,
                                 app.active_call.as_deref(),
                                 status.as_deref(),
                                 width,
@@ -1542,6 +1769,11 @@ async fn main() {
                                 }
                                 Tab::Call => {
                                     // Nothing else to render for Call
+                                }
+                                Tab::Tunes => {
+                                    if let Some(ref tunes) = app.tunes_state {
+                                        let _ = app.serial.write_str(&tunes.render());
+                                    }
                                 }
                             }
                         }
@@ -1578,16 +1810,18 @@ async fn main() {
                                     app.call_last_packet = None;
                                     app.call_connected = false;
                                     // Stop webcam
-                                    if let Some(cam) = &mut app.webcam {
-                                        let _ = cam.stop();
+                                    if let Some(cam) = &app.webcam {
+                                        cam.stop().await;
                                     }
                                     // Switch back to Chat
                                     app.active_tab = Tab::Chat;
                                     let gemini_available = app.gemini_chat.is_some();
+                                    let tunes_available = app.tunes_available();
                                     let _ = app.serial.write_str(&init_split_screen_with_tabs(
                                         &app.config.network.name,
                                         app.active_tab,
                                         gemini_available,
+                                        tunes_available,
                                         app.active_call.as_deref(),
                                         None,
                                         width,
@@ -1599,6 +1833,19 @@ async fn main() {
                                         app.input_cursor,
                                         width,
                                     ));
+                                }
+                            } else if app.active_tab == Tab::Tunes {
+                                // Space in Tunes - toggle pause/resume, or play if stopped
+                                if let Some(ref mut tunes) = app.tunes_state {
+                                    if tunes.is_active() {
+                                        tunes.toggle_pause();
+                                    } else {
+                                        // Nothing playing - start playback
+                                        if let Err(e) = tunes.play_selected() {
+                                            eprintln!("Failed to play: {}", e);
+                                        }
+                                    }
+                                    let _ = app.serial.write_str(&tunes.render());
                                 }
                             } else if app.active_tab != Tab::Call {
                                 // Space is also a printable character in other tabs
@@ -1621,7 +1868,7 @@ async fn main() {
                             }
                         }
                         InputEvent::Char(c) => {
-                            if app.active_tab != Tab::Call {
+                            if app.active_tab != Tab::Call && app.active_tab != Tab::Tunes {
                                 if app.ai_processing {
                                     continue;
                                 }

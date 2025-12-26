@@ -3,9 +3,10 @@
 //! Uses UDP for low-latency messaging with STUN for NAT traversal
 //! and UPnP for port forwarding when available.
 
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 
 mod discovery;
@@ -35,8 +36,17 @@ pub enum Message {
     CallHangup { from: String },
     /// Call rejected (busy)
     CallReject { from: String },
-    /// Stream frame (ASCII art lines)
+    /// Stream frame (ASCII art lines) - deprecated, kept for compatibility
     StreamFrame { from: String, lines: Vec<String> },
+    /// Video frame (raw grayscale image data for receiver-side rendering)
+    VideoFrame {
+        from: String,
+        width: u16,
+        height: u16,
+        pixels: Vec<u8>,
+    },
+    /// Discovery announce (sent to main port as fallback for SO_REUSEPORT issues)
+    DiscoveryAnnounce { name: String, port: u16 },
 }
 
 impl Message {
@@ -93,6 +103,26 @@ impl Message {
                     buf.extend((line.len() as u16).to_be_bytes());
                     buf.extend(line.as_bytes());
                 }
+            }
+            Message::VideoFrame {
+                from,
+                width,
+                height,
+                pixels,
+            } => {
+                buf.push(0x0A);
+                buf.push(from.len() as u8);
+                buf.extend(from.as_bytes());
+                buf.extend(width.to_be_bytes());
+                buf.extend(height.to_be_bytes());
+                buf.extend((pixels.len() as u32).to_be_bytes());
+                buf.extend(pixels);
+            }
+            Message::DiscoveryAnnounce { name, port } => {
+                buf.push(0x0B);
+                buf.extend(port.to_be_bytes());
+                buf.push(name.len() as u8);
+                buf.extend(name.as_bytes());
             }
         }
         buf
@@ -234,6 +264,55 @@ impl Message {
 
                 Some(Message::StreamFrame { from, lines })
             }
+            0x0A => {
+                // VideoFrame
+                if data.len() < 2 {
+                    return None;
+                }
+                let from_len = data[1] as usize;
+                if data.len() < 2 + from_len + 8 {
+                    return None;
+                }
+                let from = String::from_utf8_lossy(&data[2..2 + from_len]).to_string();
+
+                let mut offset = 2 + from_len;
+                let width = u16::from_be_bytes([data[offset], data[offset + 1]]);
+                offset += 2;
+                let height = u16::from_be_bytes([data[offset], data[offset + 1]]);
+                offset += 2;
+                let pixel_len = u32::from_be_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]) as usize;
+                offset += 4;
+
+                if data.len() < offset + pixel_len {
+                    return None;
+                }
+                let pixels = data[offset..offset + pixel_len].to_vec();
+
+                Some(Message::VideoFrame {
+                    from,
+                    width,
+                    height,
+                    pixels,
+                })
+            }
+            0x0B => {
+                // DiscoveryAnnounce
+                if data.len() < 4 {
+                    return None;
+                }
+                let port = u16::from_be_bytes([data[1], data[2]]);
+                let name_len = data[3] as usize;
+                if data.len() < 4 + name_len {
+                    return None;
+                }
+                let name = String::from_utf8_lossy(&data[4..4 + name_len]).to_string();
+                Some(Message::DiscoveryAnnounce { name, port })
+            }
             _ => None,
         }
     }
@@ -250,12 +329,19 @@ pub struct Peer {
     pub last_seen: std::time::Instant,
 }
 
+/// Grace period after a peer leaves before we accept discovery from them again
+const LEAVE_GRACE_PERIOD: Duration = Duration::from_secs(2);
+
 /// Network node for P2P communication
 pub struct NetworkNode {
     socket: Arc<UdpSocket>,
     local_addr: SocketAddr,
     public_addr: Option<SocketAddr>,
     peers: Vec<Peer>,
+    /// Set of all peer addresses we've ever connected to (persists across disconnects)
+    known_addrs: HashSet<SocketAddr>,
+    /// Addresses that recently sent Leave messages (addr -> time of leave)
+    recently_left: HashMap<SocketAddr, Instant>,
     name: String,
 }
 
@@ -276,6 +362,8 @@ impl NetworkNode {
             local_addr,
             public_addr: None,
             peers: Vec::new(),
+            known_addrs: HashSet::new(),
+            recently_left: HashMap::new(),
             name,
         })
     }
@@ -292,6 +380,9 @@ impl NetworkNode {
             return;
         }
 
+        // Track this address permanently
+        self.known_addrs.insert(addr);
+
         // Update existing peer or add new one
         if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == addr) {
             peer.name = name;
@@ -305,9 +396,10 @@ impl NetworkNode {
         }
     }
 
-    /// Remove a peer by address
+    /// Remove a peer by address and record their departure time
     pub fn remove_peer(&mut self, addr: SocketAddr) {
         self.peers.retain(|p| p.addr != addr);
+        self.recently_left.insert(addr, Instant::now());
     }
 
     /// Remove stale peers (not seen in the given duration)
@@ -342,6 +434,21 @@ impl NetworkNode {
         self.peers
             .iter()
             .any(|p| p.addr == addr && now.duration_since(p.last_seen) < timeout)
+    }
+
+    /// Check if we've ever connected to a peer at this address
+    pub fn knows_peer(&self, addr: SocketAddr) -> bool {
+        self.known_addrs.contains(&addr)
+    }
+
+    /// Check if a peer recently left (within grace period)
+    /// Also cleans up stale entries
+    pub fn recently_left(&mut self, addr: SocketAddr) -> bool {
+        let now = Instant::now();
+        // Clean up old entries
+        self.recently_left
+            .retain(|_, left_at| now.duration_since(*left_at) < LEAVE_GRACE_PERIOD);
+        self.recently_left.contains_key(&addr)
     }
 
     /// Update the last_seen time for a peer
@@ -453,6 +560,32 @@ mod tests {
         let decoded = Message::from_bytes(&bytes).unwrap();
         match decoded {
             Message::Ping { seq } => assert_eq!(seq, 42),
+            _ => panic!("Wrong message type"),
+        }
+    }
+
+    #[test]
+    fn test_video_frame_roundtrip() {
+        let frame = Message::VideoFrame {
+            from: "Bob".to_string(),
+            width: 80,
+            height: 44,
+            pixels: vec![0, 128, 255, 64, 192],
+        };
+        let bytes = frame.to_bytes();
+        let decoded = Message::from_bytes(&bytes).unwrap();
+        match decoded {
+            Message::VideoFrame {
+                from,
+                width,
+                height,
+                pixels,
+            } => {
+                assert_eq!(from, "Bob");
+                assert_eq!(width, 80);
+                assert_eq!(height, 44);
+                assert_eq!(pixels, vec![0, 128, 255, 64, 192]);
+            }
             _ => panic!("Wrong message type"),
         }
     }

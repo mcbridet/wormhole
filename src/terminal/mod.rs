@@ -65,15 +65,18 @@ pub const MAX_SCROLLBACK: usize = 10_000;
 pub enum Tab {
     Chat = 0,
     Call = 1,
-    Gemini = 2,
+    Tunes = 2,
+    Gemini = 3,
 }
 
 impl Tab {
-    pub fn next(self, gemini_available: bool, call_active: bool) -> Self {
+    pub fn next(self, gemini_available: bool, call_active: bool, tunes_available: bool) -> Self {
         match self {
             Tab::Chat => {
                 if call_active {
                     Tab::Call
+                } else if tunes_available {
+                    Tab::Tunes
                 } else if gemini_available {
                     Tab::Gemini
                 } else {
@@ -81,6 +84,15 @@ impl Tab {
                 }
             }
             Tab::Call => {
+                if tunes_available {
+                    Tab::Tunes
+                } else if gemini_available {
+                    Tab::Gemini
+                } else {
+                    Tab::Chat
+                }
+            }
+            Tab::Tunes => {
                 if gemini_available {
                     Tab::Gemini
                 } else {

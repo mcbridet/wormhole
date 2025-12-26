@@ -26,6 +26,7 @@ fn draw_horizontal_line(left: DecGraphicsChar, right: DecGraphicsChar, width: us
 fn draw_tab_bar(
     active_tab: Tab,
     gemini_available: bool,
+    tunes_available: bool,
     active_call: Option<&str>,
     width: usize,
 ) -> String {
@@ -51,7 +52,7 @@ fn draw_tab_bar(
     };
 
     // Determine next tab for hint
-    let next_tab = active_tab.next(gemini_available, active_call.is_some());
+    let next_tab = active_tab.next(gemini_available, active_call.is_some(), tunes_available);
 
     // Chat Tab
     output.push_str(&draw_tab(
@@ -71,6 +72,19 @@ fn draw_tab_bar(
             &label,
             active_tab == Tab::Call,
             next_tab == Tab::Call,
+        ));
+    }
+
+    // Tunes Tab (if available)
+    if tunes_available {
+        output.push_str(ENTER_DEC_GRAPHICS);
+        output.push(HorizontalLine.as_dec_char());
+        output.push_str(EXIT_DEC_GRAPHICS);
+
+        output.push_str(&draw_tab(
+            "Tunes",
+            active_tab == Tab::Tunes,
+            next_tab == Tab::Tunes,
         ));
     }
 
@@ -117,6 +131,18 @@ fn draw_tab_bar(
         };
     }
 
+    // Tunes
+    if tunes_available {
+        visible_len += 1; // Separator
+        visible_len += if active_tab == Tab::Tunes {
+            7 // "[Tunes]"
+        } else if next_tab == Tab::Tunes {
+            13 // " Tunes <Tab> "
+        } else {
+            7 // " Tunes "
+        };
+    }
+
     // AI
     if gemini_available {
         visible_len += 1; // Separator
@@ -154,6 +180,7 @@ fn draw_tab_bar(
 pub fn redraw_tab_bar(
     active_tab: Tab,
     gemini_available: bool,
+    tunes_available: bool,
     active_call: Option<&str>,
     width: usize,
 ) -> String {
@@ -162,6 +189,7 @@ pub fn redraw_tab_bar(
     output.push_str(&draw_tab_bar(
         active_tab,
         gemini_available,
+        tunes_available,
         active_call,
         width,
     ));
@@ -188,6 +216,7 @@ pub fn init_split_screen_with_tabs(
     client_name: &str,
     active_tab: Tab,
     gemini_available: bool,
+    tunes_available: bool,
     active_call: Option<&str>,
     call_status: Option<&str>,
     width: usize,
@@ -205,12 +234,13 @@ pub fn init_split_screen_with_tabs(
     output.push_str(&draw_tab_bar(
         active_tab,
         gemini_available,
+        tunes_available,
         active_call,
         width,
     ));
 
-    if active_tab == Tab::Call {
-        // Draw full box for Call (no split)
+    if active_tab == Tab::Call || active_tab == Tab::Tunes {
+        // Draw full box for Call/Tunes (no split)
         // Rows 2-23: Left and right borders
         for row in 2..=23 {
             output.push_str(&esc::cursor_to(row, 1));

@@ -2,3 +2,4 @@
 *.ini
 !example.ini
 /logs
+/tunes/**

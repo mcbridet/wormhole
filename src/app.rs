@@ -7,13 +7,15 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::gemini::GeminiChat;
+use crate::graphics::Frame;
 use crate::log::SessionLogger;
 use crate::network::{
     self, DiscoveredPeer, Discovery, Message, NetworkNode, PeerEvent, run_discovery,
 };
 use crate::serial::Serial;
 use crate::terminal::{ChatBuffer, Tab, init_split_screen_with_tabs};
-use crate::webcam::WebcamStream;
+use crate::tunes::TunesState;
+use crate::webcam::{RawFrame, Webcam};
 
 /// Helper macro to print status and flush stdout
 macro_rules! status {
@@ -27,8 +29,9 @@ pub struct App {
     pub config: Config,
     pub serial: Serial,
     pub net_node: NetworkNode,
-    pub webcam: Option<WebcamStream>,
+    pub webcam: Option<Webcam>,
     pub gemini_chat: Option<GeminiChat>,
+    pub tunes_state: Option<TunesState>,
     pub chat_buffer: ChatBuffer,
     pub ai_buffer: ChatBuffer,
     pub logger: Option<SessionLogger>,
@@ -36,8 +39,9 @@ pub struct App {
     pub active_call: Option<String>,
     pub call_connected: bool,
     pub call_last_packet: Option<std::time::Instant>,
-    pub current_stream_frame: Option<(String, Vec<String>)>,
-    pub last_rendered_frame: Option<Vec<String>>,
+    /// Current received video frame (raw grayscale data for local rendering)
+    pub current_video_frame: Option<(String, RawFrame)>,
+    pub last_rendered_frame: Option<Frame>,
     pub line_buffer: String,
     pub input_cursor: usize,
     pub input_history: Vec<String>,
@@ -151,7 +155,20 @@ impl App {
 
         // Set up peer discovery
         status!("Starting LAN discovery... ");
-        let discovery = match Discovery::new(config.network.name.clone(), config.network.port).await
+        // Parse bind_ip for discovery - determines which interface to broadcast on
+        let discovery_bind_ip: std::net::Ipv4Addr = config
+            .network
+            .bind_ip
+            .as_ref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+
+        let discovery = match Discovery::new(
+            config.network.name.clone(),
+            config.network.port,
+            discovery_bind_ip,
+        )
+        .await
         {
             Ok(d) => {
                 println!("OK");
@@ -162,7 +179,7 @@ impl App {
                 eprintln!("  {} (continuing without LAN discovery)", e);
                 // Continue without discovery - we can still connect to manual peers
                 Arc::new(
-                    Discovery::new(config.network.name.clone(), 0)
+                    Discovery::new(config.network.name.clone(), 0, discovery_bind_ip)
                         .await
                         .unwrap(),
                 )
@@ -171,6 +188,8 @@ impl App {
 
         // Channels for discovered peers
         let (discovery_tx, discovery_rx) = mpsc::channel::<DiscoveredPeer>(32);
+        // Clone sender for use in network receive task (for DiscoveryAnnounce messages on main port)
+        let discovery_tx_clone = discovery_tx.clone();
 
         // Shutdown signal for discovery
         let (discovery_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -194,6 +213,7 @@ impl App {
 
         // Spawn network receive task
         let net_recv_task = tokio::spawn(async move {
+            let discovery_tx = discovery_tx_clone;
             let mut buf = [0u8; 65535]; // Increased buffer size for stream frames
             while running_net.load(Ordering::SeqCst) {
                 // Use a timeout to allow checking the running flag periodically
@@ -213,6 +233,9 @@ impl App {
                                             let _ = net_tx.send(msg).await;
                                         }
                                         Message::StreamFrame { .. } => {
+                                            let _ = net_tx.send(msg).await;
+                                        }
+                                        Message::VideoFrame { .. } => {
                                             let _ = net_tx.send(msg).await;
                                         }
                                         Message::CallRequest { .. } => {
@@ -242,6 +265,16 @@ impl App {
                                         Message::Pong { .. } => {
                                             // Latency measurement could go here
                                         }
+                                        Message::DiscoveryAnnounce { name, port } => {
+                                            // Discovery announce received on main port (bypasses SO_REUSEPORT)
+                                            // Forward to discovery channel as if we received it normally
+                                            let peer_addr = SocketAddr::new(_addr.ip(), port);
+                                            let peer = DiscoveredPeer {
+                                                name,
+                                                addr: peer_addr,
+                                            };
+                                            let _ = discovery_tx.send(peer).await;
+                                        }
                                     }
                                 }
                             }
@@ -260,8 +293,8 @@ impl App {
         });
 
         // Calculate terminal width for chat buffers and Gemini
-        let use_drcs = config.terminal.mode == "vt220";
-        let use_132_cols = config.terminal.mode == "vt220";
+        let use_drcs = config.terminal.mode == "vt220" || config.terminal.mode == "vt340";
+        let use_132_cols = config.terminal.cols_132;
         let width = if use_132_cols { 132 } else { 80 };
 
         // Initialize Gemini chat if configured
@@ -278,6 +311,17 @@ impl App {
             None
         };
 
+        // Initialize tunes state if configured
+        let tunes_available = TunesState::is_available(config.tunes.directory.as_deref());
+        let tunes_state = if tunes_available {
+            Some(TunesState::new(
+                config.tunes.directory.as_ref().unwrap(),
+                width,
+            ))
+        } else {
+            None
+        };
+
         // Tab state
         let active_tab = Tab::Chat;
         let active_call: Option<String> = None;
@@ -290,6 +334,7 @@ impl App {
             &config.network.name,
             active_tab,
             gemini_available,
+            tunes_available,
             active_call.as_deref(),
             None,
             width,
@@ -297,15 +342,11 @@ impl App {
 
         // Create chat buffers for each tab
         let chat_buffer = ChatBuffer::new(width);
-        let webcam = match WebcamStream::new(config.webcam.device.as_deref()) {
-            Ok(cam) => {
-                eprintln!("Webcam initialized successfully.");
-                Some(cam)
-            }
-            Err(e) => {
-                eprintln!("Warning: Failed to initialize webcam: {}", e);
-                None
-            }
+        let webcam = if config.webcam.device.is_some() {
+            eprintln!("Initializing webcam thread...");
+            Some(Webcam::new(config.webcam.device.clone()))
+        } else {
+            None
         };
 
         let ai_buffer = ChatBuffer::new(width);
@@ -319,6 +360,7 @@ impl App {
             net_node,
             webcam,
             gemini_chat,
+            tunes_state,
             chat_buffer,
             ai_buffer,
             logger,
@@ -326,7 +368,7 @@ impl App {
             active_call,
             call_connected: false,
             call_last_packet: None,
-            current_stream_frame: None,
+            current_video_frame: None,
             last_rendered_frame: None,
             line_buffer: String::new(),
             input_cursor: 0,
@@ -359,5 +401,10 @@ impl App {
             logger.log_ai(&message);
         }
         self.ai_buffer.push(message);
+    }
+
+    /// Check if tunes tab is available
+    pub fn tunes_available(&self) -> bool {
+        self.tunes_state.is_some()
     }
 }
