@@ -45,6 +45,16 @@ pub enum Message {
         height: u16,
         pixels: Vec<u8>,
     },
+    /// Video frame fragment (for large frames that exceed UDP MTU)
+    VideoFrameFragment {
+        from: String,
+        width: u16,
+        height: u16,
+        frame_id: u8,        // Unique ID for this frame (wraps around)
+        fragment_idx: u8,    // Which fragment this is (0-indexed)
+        total_fragments: u8, // Total number of fragments
+        data: Vec<u8>,       // Compressed pixel data fragment
+    },
     /// Discovery announce (sent to main port as fallback for SO_REUSEPORT issues)
     DiscoveryAnnounce { name: String, port: u16 },
 }
@@ -115,8 +125,31 @@ impl Message {
                 buf.extend(from.as_bytes());
                 buf.extend(width.to_be_bytes());
                 buf.extend(height.to_be_bytes());
+                // Store uncompressed size, then LZ4 compressed data
                 buf.extend((pixels.len() as u32).to_be_bytes());
-                buf.extend(pixels);
+                let compressed = lz4_flex::compress_prepend_size(pixels);
+                buf.extend((compressed.len() as u32).to_be_bytes());
+                buf.extend(&compressed);
+            }
+            Message::VideoFrameFragment {
+                from,
+                width,
+                height,
+                frame_id,
+                fragment_idx,
+                total_fragments,
+                data,
+            } => {
+                buf.push(0x0C);
+                buf.push(from.len() as u8);
+                buf.extend(from.as_bytes());
+                buf.extend(width.to_be_bytes());
+                buf.extend(height.to_be_bytes());
+                buf.push(*frame_id);
+                buf.push(*fragment_idx);
+                buf.push(*total_fragments);
+                buf.extend((data.len() as u32).to_be_bytes());
+                buf.extend(data);
             }
             Message::DiscoveryAnnounce { name, port } => {
                 buf.push(0x0B);
@@ -265,12 +298,12 @@ impl Message {
                 Some(Message::StreamFrame { from, lines })
             }
             0x0A => {
-                // VideoFrame
+                // VideoFrame (LZ4 compressed)
                 if data.len() < 2 {
                     return None;
                 }
                 let from_len = data[1] as usize;
-                if data.len() < 2 + from_len + 8 {
+                if data.len() < 2 + from_len + 12 {
                     return None;
                 }
                 let from = String::from_utf8_lossy(&data[2..2 + from_len]).to_string();
@@ -280,7 +313,16 @@ impl Message {
                 offset += 2;
                 let height = u16::from_be_bytes([data[offset], data[offset + 1]]);
                 offset += 2;
-                let pixel_len = u32::from_be_bytes([
+                // Uncompressed size (for validation)
+                let _uncompressed_len = u32::from_be_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]) as usize;
+                offset += 4;
+                // Compressed size
+                let compressed_len = u32::from_be_bytes([
                     data[offset],
                     data[offset + 1],
                     data[offset + 2],
@@ -288,10 +330,16 @@ impl Message {
                 ]) as usize;
                 offset += 4;
 
-                if data.len() < offset + pixel_len {
+                if data.len() < offset + compressed_len {
                     return None;
                 }
-                let pixels = data[offset..offset + pixel_len].to_vec();
+                let compressed = &data[offset..offset + compressed_len];
+
+                // Decompress the pixel data
+                let pixels = match lz4_flex::decompress_size_prepended(compressed) {
+                    Ok(p) => p,
+                    Err(_) => return None,
+                };
 
                 Some(Message::VideoFrame {
                     from,
@@ -313,6 +361,51 @@ impl Message {
                 let name = String::from_utf8_lossy(&data[4..4 + name_len]).to_string();
                 Some(Message::DiscoveryAnnounce { name, port })
             }
+            0x0C => {
+                // VideoFrameFragment
+                if data.len() < 2 {
+                    return None;
+                }
+                let from_len = data[1] as usize;
+                if data.len() < 2 + from_len + 11 {
+                    return None;
+                }
+                let from = String::from_utf8_lossy(&data[2..2 + from_len]).to_string();
+
+                let mut offset = 2 + from_len;
+                let width = u16::from_be_bytes([data[offset], data[offset + 1]]);
+                offset += 2;
+                let height = u16::from_be_bytes([data[offset], data[offset + 1]]);
+                offset += 2;
+                let frame_id = data[offset];
+                offset += 1;
+                let fragment_idx = data[offset];
+                offset += 1;
+                let total_fragments = data[offset];
+                offset += 1;
+                let data_len = u32::from_be_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]) as usize;
+                offset += 4;
+
+                if data.len() < offset + data_len {
+                    return None;
+                }
+                let frag_data = data[offset..offset + data_len].to_vec();
+
+                Some(Message::VideoFrameFragment {
+                    from,
+                    width,
+                    height,
+                    frame_id,
+                    fragment_idx,
+                    total_fragments,
+                    data: frag_data,
+                })
+            }
             _ => None,
         }
     }
@@ -332,6 +425,59 @@ pub struct Peer {
 /// Grace period after a peer leaves before we accept discovery from them again
 const LEAVE_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
+/// Buffer for reassembling fragmented video frames
+#[derive(Debug)]
+#[allow(dead_code)]
+struct FragmentBuffer {
+    from: String,
+    width: u16,
+    height: u16,
+    frame_id: u8,
+    total_fragments: u8,
+    fragments: Vec<Option<Vec<u8>>>,
+    received_at: Instant,
+}
+
+impl FragmentBuffer {
+    fn new(from: String, width: u16, height: u16, frame_id: u8, total_fragments: u8) -> Self {
+        Self {
+            from,
+            width,
+            height,
+            frame_id,
+            total_fragments,
+            fragments: vec![None; total_fragments as usize],
+            received_at: Instant::now(),
+        }
+    }
+
+    fn add_fragment(&mut self, idx: u8, data: Vec<u8>) {
+        if (idx as usize) < self.fragments.len() {
+            self.fragments[idx as usize] = Some(data);
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.fragments.iter().all(|f| f.is_some())
+    }
+
+    fn reassemble(&self) -> Option<Vec<u8>> {
+        if !self.is_complete() {
+            return None;
+        }
+        let compressed: Vec<u8> = self
+            .fragments
+            .iter()
+            .filter_map(|f| f.as_ref())
+            .flatten()
+            .copied()
+            .collect();
+
+        // Decompress
+        lz4_flex::decompress_size_prepended(&compressed).ok()
+    }
+}
+
 /// Network node for P2P communication
 pub struct NetworkNode {
     socket: Arc<UdpSocket>,
@@ -343,6 +489,8 @@ pub struct NetworkNode {
     /// Addresses that recently sent Leave messages (addr -> time of leave)
     recently_left: HashMap<SocketAddr, Instant>,
     name: String,
+    /// Fragment buffers for reassembling video frames (keyed by (peer_name, frame_id))
+    fragment_buffers: HashMap<(String, u8), FragmentBuffer>,
 }
 
 impl NetworkNode {
@@ -365,6 +513,7 @@ impl NetworkNode {
             known_addrs: HashSet::new(),
             recently_left: HashMap::new(),
             name,
+            fragment_buffers: HashMap::new(),
         })
     }
 
@@ -466,6 +615,106 @@ impl NetworkNode {
             .await
             .map_err(|e| NetworkError::Send(e.to_string()))?;
         Ok(())
+    }
+
+    /// Send a video frame, fragmenting if necessary to fit within UDP MTU
+    /// Max safe UDP payload is ~60KB, we use 50KB to be conservative
+    pub async fn send_video_frame(
+        &self,
+        from: &str,
+        width: u16,
+        height: u16,
+        pixels: &[u8],
+        frame_id: u8,
+        addr: SocketAddr,
+    ) -> Result<(), NetworkError> {
+        // Compress the pixels first
+        let compressed = lz4_flex::compress_prepend_size(pixels);
+
+        // Max fragment size - use 1400 bytes to stay under typical MTU (1500)
+        // and avoid IP-level fragmentation which causes packet loss
+        const MAX_FRAGMENT_SIZE: usize = 1400;
+
+        if compressed.len() <= MAX_FRAGMENT_SIZE {
+            // Can send as a single fragment
+            let msg = Message::VideoFrameFragment {
+                from: from.to_string(),
+                width,
+                height,
+                frame_id,
+                fragment_idx: 0,
+                total_fragments: 1,
+                data: compressed,
+            };
+            self.send_to(&msg, addr).await
+        } else {
+            // Need to fragment
+            let total_fragments = compressed.len().div_ceil(MAX_FRAGMENT_SIZE);
+            if total_fragments > 255 {
+                return Err(NetworkError::Send(
+                    "Frame too large to fragment".to_string(),
+                ));
+            }
+
+            for (idx, chunk) in compressed.chunks(MAX_FRAGMENT_SIZE).enumerate() {
+                let msg = Message::VideoFrameFragment {
+                    from: from.to_string(),
+                    width,
+                    height,
+                    frame_id,
+                    fragment_idx: idx as u8,
+                    total_fragments: total_fragments as u8,
+                    data: chunk.to_vec(),
+                };
+                self.send_to(&msg, addr).await?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Process a video frame fragment. Returns Some(VideoFrame) if the frame is now complete.
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_fragment(
+        &mut self,
+        from: String,
+        width: u16,
+        height: u16,
+        frame_id: u8,
+        fragment_idx: u8,
+        total_fragments: u8,
+        data: Vec<u8>,
+    ) -> Option<Message> {
+        // Clean up old fragment buffers (older than 2 seconds)
+        let now = Instant::now();
+        self.fragment_buffers
+            .retain(|_, buf| now.duration_since(buf.received_at) < Duration::from_secs(2));
+
+        // Key is (peer_name, frame_id) to allow multiple frames to be assembled in parallel
+        let key = (from.clone(), frame_id);
+
+        // Get or create buffer for this frame
+        let buffer = self.fragment_buffers.entry(key.clone()).or_insert_with(|| {
+            FragmentBuffer::new(from.clone(), width, height, frame_id, total_fragments)
+        });
+
+        // Add the fragment
+        buffer.add_fragment(fragment_idx, data);
+
+        // Check if complete and reassemble
+        if buffer.is_complete()
+            && let Some(pixels) = buffer.reassemble()
+        {
+            // Remove the buffer
+            self.fragment_buffers.remove(&key);
+            return Some(Message::VideoFrame {
+                from,
+                width,
+                height,
+                pixels,
+            });
+        }
+
+        None
     }
 
     /// Broadcast a message to all peers

@@ -48,6 +48,8 @@ pub struct App {
     pub history_index: Option<usize>,
     pub ai_processing: bool,
     pub running: Arc<AtomicBool>,
+    /// Frame ID counter for video transmission (wraps at 255)
+    pub video_frame_id: u8,
 
     // Channels
     pub discovery_rx: mpsc::Receiver<DiscoveredPeer>,
@@ -62,6 +64,8 @@ pub struct App {
     pub stats_last_check: std::time::Instant,
     pub stats_bytes_sent: usize,
     pub stats_frames_rendered: usize,
+    pub stats_frames_sent: usize,
+    pub stats_frames_received: usize,
 }
 
 impl App {
@@ -238,6 +242,10 @@ impl App {
                                         Message::VideoFrame { .. } => {
                                             let _ = net_tx.send(msg).await;
                                         }
+                                        Message::VideoFrameFragment { .. } => {
+                                            // Forward fragments to be reassembled in main loop
+                                            let _ = net_tx.send(msg).await;
+                                        }
                                         Message::CallRequest { .. } => {
                                             let _ = net_tx.send(msg).await;
                                         }
@@ -343,7 +351,6 @@ impl App {
         // Create chat buffers for each tab
         let chat_buffer = ChatBuffer::new(width);
         let webcam = if config.webcam.device.is_some() {
-            eprintln!("Initializing webcam thread...");
             Some(Webcam::new(config.webcam.device.clone()))
         } else {
             None
@@ -376,6 +383,7 @@ impl App {
             history_index: None,
             ai_processing: false,
             running,
+            video_frame_id: 0,
             discovery_rx,
             net_rx,
             peer_event_rx,
@@ -384,6 +392,8 @@ impl App {
             stats_last_check: std::time::Instant::now(),
             stats_bytes_sent: 0,
             stats_frames_rendered: 0,
+            stats_frames_sent: 0,
+            stats_frames_received: 0,
         })
     }
 

@@ -47,7 +47,7 @@ Browse and play audio files from a configured directory.
 ## Prerequisites
 
 - Rust 1.90+
-- Linux (for V4L2 webcam support)
+- Linux (V4L2 webcam) or macOS (AVFoundation webcam)
 - A serial terminal or emulator (VT100/VT220/VT340 compatible)
 
 ### Optional

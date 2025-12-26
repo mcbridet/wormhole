@@ -224,7 +224,8 @@ pub fn image_to_sixel(
     // VT340 character cell is approximately 10 pixels wide
     // So display_width columns = display_width * 10 pixels
     const PIXELS_PER_COL: u32 = 10;
-    let max_width_pixels = (display_width.saturating_sub(4) as u32) * PIXELS_PER_COL;
+    // Use nearly full width, leaving small margin for UI
+    let max_width_pixels = ((display_width.saturating_sub(2)) as u32) * PIXELS_PER_COL;
 
     // Calculate aspect-correct width
     let (img_w, img_h) = image.dimensions();

@@ -503,40 +503,26 @@ fn enhance_contrast(image: &image::GrayImage) -> image::GrayImage {
     result
 }
 
-/// Prepare common image dimensions for rendering
-/// Returns (target_width, target_height) for the processed image
-fn calculate_frame_dimensions(
-    image: &DynamicImage,
-    height_rows: u32,
-    display_width: usize,
-) -> (u32, u32) {
-    // Calculate target dimensions accounting for character aspect ratio (~2:1)
-    // We sample 2 vertical pixels for each character row
-    let target_height = height_rows * 2;
+/// Process an image to raw grayscale frame data for network transmission
+/// Uses sixel-compatible resolution so receivers can render at full quality
+/// ASCII/DRCS receivers will downsample as needed
+fn image_to_raw_frame(image: &DynamicImage, height_rows: u32, display_width: usize) -> RawFrame {
+    // Use sixel-compatible resolution (18 pixels per row) for network transmission
+    // This ensures sixel receivers get good quality
+    // ASCII/DRCS receivers will downsample in raw_frame_to_output
+    const PIXELS_PER_ROW: u32 = 18;
+    let target_height = height_rows * PIXELS_PER_ROW;
 
     let (img_w, img_h) = image.dimensions();
-    let mut aspect = img_w as f32 / img_h as f32;
+    let aspect = img_w as f32 / img_h as f32;
 
-    // If we have a wide display (132 cols), let's try to be at least 16:9
-    if display_width > 100 {
-        aspect = aspect.max(1.77);
-    }
+    // Calculate width based on height and aspect ratio
+    // Use nearly full display width, leaving small margin for UI
+    const PIXELS_PER_COL: u32 = 10;
+    let max_width = (display_width.saturating_sub(2) as u32) * PIXELS_PER_COL;
 
-    // Calculate ideal width to maintain aspect ratio
     let ideal_width = (target_height as f32 * aspect) as u32;
-
-    // Constrain to display width (minus padding)
-    let max_width = (display_width.saturating_sub(4)) as u32;
     let target_width = ideal_width.min(max_width);
-
-    (target_width, target_height)
-}
-
-/// Process an image to raw grayscale frame data for network transmission
-/// The image is resized, cropped, converted to grayscale, and contrast-enhanced
-fn image_to_raw_frame(image: &DynamicImage, height_rows: u32, display_width: usize) -> RawFrame {
-    let (target_width, target_height) =
-        calculate_frame_dimensions(image, height_rows, display_width);
 
     // Resize and crop to fill the target dimensions
     let resized = image.resize_to_fill(target_width, target_height, FilterType::Triangle);
@@ -556,6 +542,7 @@ fn image_to_raw_frame(image: &DynamicImage, height_rows: u32, display_width: usi
 
 /// Render a raw grayscale frame to terminal output lines
 /// This allows the receiver to render according to their terminal capabilities
+/// Frame is expected to be at sixel resolution (18 pixels per row)
 pub fn raw_frame_to_output(
     frame: &RawFrame,
     render_mode: RenderMode,
@@ -563,7 +550,10 @@ pub fn raw_frame_to_output(
 ) -> Vec<String> {
     let width = frame.width as u32;
     let height = frame.height as u32;
-    let height_rows = height / 2; // Each character row represents 2 pixel rows
+
+    // Frame is at sixel resolution: 18 pixels per terminal row
+    const PIXELS_PER_ROW: u32 = 18;
+    let height_rows = height / PIXELS_PER_ROW;
 
     // For sixel mode, reconstruct a DynamicImage and use sixel encoder
     if let RenderMode::Sixel { shades: _ } = render_mode {
@@ -576,6 +566,7 @@ pub fn raw_frame_to_output(
                 gray_levels: sixel_shades,
                 ..Default::default()
             };
+            // Pass the frame directly - it's already at the right resolution
             let sixel_output =
                 image_to_sixel(&image, height_rows, width as usize + 4, Some(&config));
             return vec![sixel_output];
@@ -584,32 +575,48 @@ pub fn raw_frame_to_output(
         return vec!["[sixel render error]".to_string()];
     }
 
-    // For ASCII/DRCS modes, render from raw pixel data
+    // For ASCII/DRCS modes, we need to downsample from sixel resolution to character resolution
+    // Each character represents PIXELS_PER_ROW vertical pixels and ~9 horizontal pixels
     let use_drcs = render_mode == RenderMode::Drcs;
-    let mut lines = Vec::with_capacity(height_rows as usize);
 
-    // Process 2 rows at a time, averaging them for each character row
-    for row in 0..height_rows {
-        let mut line = String::with_capacity(width as usize + 10);
+    // Calculate how many source pixels per character
+    let pixels_per_char_y = PIXELS_PER_ROW;
+    let pixels_per_char_x = 9u32; // Approximate character width in pixels
+
+    let char_cols = width / pixels_per_char_x;
+    let char_rows = height_rows;
+
+    let mut lines = Vec::with_capacity(char_rows as usize);
+
+    for row in 0..char_rows {
+        let mut line = String::with_capacity(char_cols as usize + 10);
 
         if use_drcs {
             line.push_str(SHIFT_OUT);
 
-            for col in 0..width {
-                let y1 = row * 2;
-                let y2 = row * 2 + 1;
+            for col in 0..char_cols {
+                // Sample a block of pixels and average them
+                let x_start = col * pixels_per_char_x;
+                let y_start = row * pixels_per_char_y;
 
-                let idx1 = (y1 * width + col) as usize;
-                let idx2 = (y2 * width + col) as usize;
+                let mut sum = 0u32;
+                let mut count = 0u32;
 
-                let p1 = frame.pixels.get(idx1).copied().unwrap_or(0) as u16;
-                let p2 = if y2 < height {
-                    frame.pixels.get(idx2).copied().unwrap_or(0) as u16
-                } else {
-                    p1
-                };
+                for dy in 0..pixels_per_char_y {
+                    for dx in 0..pixels_per_char_x {
+                        let x = x_start + dx;
+                        let y = y_start + dy;
+                        if x < width && y < height {
+                            let idx = (y * width + x) as usize;
+                            if let Some(&p) = frame.pixels.get(idx) {
+                                sum += p as u32;
+                                count += 1;
+                            }
+                        }
+                    }
+                }
 
-                let avg = ((p1 + p2) / 2) as u8;
+                let avg = if count > 0 { (sum / count) as u8 } else { 0 };
                 let char = brightness_to_drcs_char(avg);
                 line.push(char);
             }
@@ -619,34 +626,44 @@ pub fn raw_frame_to_output(
             // Enhanced ASCII mode
             let mut current_is_dec = false;
 
-            for col in 0..width {
-                let y1 = row * 2;
-                let y2 = row * 2 + 1;
+            for col in 0..char_cols {
+                // Sample a block of pixels and average them
+                let x_start = col * pixels_per_char_x;
+                let y_start = row * pixels_per_char_y;
 
-                let idx1 = (y1 * width + col) as usize;
-                let idx2 = (y2 * width + col) as usize;
+                let mut sum = 0u32;
+                let mut count = 0u32;
 
-                let p1 = frame.pixels.get(idx1).copied().unwrap_or(0) as u16;
-                let p2 = if y2 < height {
-                    frame.pixels.get(idx2).copied().unwrap_or(0) as u16
-                } else {
-                    p1
-                };
+                for dy in 0..pixels_per_char_y {
+                    for dx in 0..pixels_per_char_x {
+                        let x = x_start + dx;
+                        let y = y_start + dy;
+                        if x < width && y < height {
+                            let idx = (y * width + x) as usize;
+                            if let Some(&p) = frame.pixels.get(idx) {
+                                sum += p as u32;
+                                count += 1;
+                            }
+                        }
+                    }
+                }
 
-                let avg = ((p1 + p2) / 2) as u8;
+                let avg = if count > 0 { (sum / count) as u8 } else { 0 };
                 let (char, is_dec) = brightness_to_enhanced_char(avg);
 
-                if is_dec != current_is_dec {
-                    if is_dec {
-                        line.push_str(SHIFT_OUT);
-                    } else {
-                        line.push_str(SHIFT_IN);
-                    }
-                    current_is_dec = is_dec;
+                // Switch character set if needed
+                if is_dec && !current_is_dec {
+                    line.push_str(SHIFT_OUT);
+                    current_is_dec = true;
+                } else if !is_dec && current_is_dec {
+                    line.push_str(SHIFT_IN);
+                    current_is_dec = false;
                 }
+
                 line.push(char);
             }
 
+            // End line in normal character set
             if current_is_dec {
                 line.push_str(SHIFT_IN);
             }

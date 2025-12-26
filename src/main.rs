@@ -339,6 +339,11 @@ async fn main() {
                     app.call_last_packet = None;
                     app.call_connected = false;
 
+                    // Stop webcam
+                    if let Some(cam) = &app.webcam {
+                        cam.stop().await;
+                    }
+
                     // Redraw UI if needed
                     if app.active_tab == Tab::Call {
                         // Switch back to Chat
@@ -426,15 +431,21 @@ async fn main() {
             }
         }
 
-        // Check for incoming network messages - drain all pending
+        // Check for incoming network messages - process limited batch to avoid starving other tasks
         let mut had_messages = false;
-        while let Ok(msg) = app.net_rx.try_recv() {
+        let mut messages_processed = 0;
+        const MAX_MESSAGES_PER_TICK: usize = 500; // Limit to prevent infinite loop on high fragment traffic
+        while messages_processed < MAX_MESSAGES_PER_TICK
+            && let Ok(msg) = app.net_rx.try_recv()
+        {
+            messages_processed += 1;
             // Update call timeout if message is from active peer
             if let Some(peer_name) = &app.active_call {
                 let from_peer = match &msg {
                     Message::Chat { from, .. } => Some(from),
                     Message::StreamFrame { from, .. } => Some(from),
                     Message::VideoFrame { from, .. } => Some(from),
+                    Message::VideoFrameFragment { from, .. } => Some(from),
                     Message::CallRequest { from } => Some(from),
                     Message::CallHangup { from } => Some(from),
                     _ => None,
@@ -650,6 +661,42 @@ async fn main() {
                             pixels,
                         },
                     ));
+                    app.stats_frames_received += 1;
+                }
+                Message::VideoFrameFragment {
+                    from,
+                    width,
+                    height,
+                    frame_id,
+                    fragment_idx,
+                    total_fragments,
+                    data,
+                } => {
+                    // Process the fragment and check if frame is complete
+                    if let Some(Message::VideoFrame {
+                        from,
+                        width,
+                        height,
+                        pixels,
+                    }) = app.net_node.process_fragment(
+                        from,
+                        width,
+                        height,
+                        frame_id,
+                        fragment_idx,
+                        total_fragments,
+                        data,
+                    ) {
+                        app.current_video_frame = Some((
+                            from,
+                            RawFrame {
+                                width,
+                                height,
+                                pixels,
+                            },
+                        ));
+                        app.stats_frames_received += 1;
+                    }
                 }
                 _ => {}
             }
@@ -698,18 +745,25 @@ async fn main() {
                                 .map(|p| p.addr);
 
                             if let Some(addr) = target_addr {
-                                // Send raw frame data - receiver will render according to their terminal
-                                let msg = Message::VideoFrame {
-                                    from: app.config.network.name.clone(),
-                                    width: raw_frame.width,
-                                    height: raw_frame.height,
-                                    pixels: raw_frame.pixels,
-                                };
+                                // Send raw frame data with fragmentation support
+                                let frame_id = app.video_frame_id;
+                                app.video_frame_id = app.video_frame_id.wrapping_add(1);
 
-                                if let Err(e) =
-                                    futures::executor::block_on(app.net_node.send_to(&msg, addr))
+                                if let Err(e) = app
+                                    .net_node
+                                    .send_video_frame(
+                                        &app.config.network.name,
+                                        raw_frame.width,
+                                        raw_frame.height,
+                                        &raw_frame.pixels,
+                                        frame_id,
+                                        addr,
+                                    )
+                                    .await
                                 {
                                     eprintln!("Failed to send video frame: {}", e);
+                                } else {
+                                    app.stats_frames_sent += 1;
                                 }
                             }
                         }
@@ -809,12 +863,19 @@ async fn main() {
                 let elapsed = app.stats_last_check.elapsed().as_secs_f64();
                 let fps = app.stats_frames_rendered as f64 / elapsed;
                 let kbps = (app.stats_bytes_sent as f64 / 1024.0) / elapsed;
+                let tx_fps = app.stats_frames_sent as f64 / elapsed;
+                let rx_fps = app.stats_frames_received as f64 / elapsed;
 
-                eprintln!("[Call Stats] FPS: {:.1}, BW: {:.1} KB/s", fps, kbps);
+                eprintln!(
+                    "[Call Stats] Render: {:.1} FPS, TX: {:.1} FPS, RX: {:.1} FPS, BW: {:.1} KB/s",
+                    fps, tx_fps, rx_fps, kbps
+                );
 
                 app.stats_last_check = std::time::Instant::now();
                 app.stats_frames_rendered = 0;
                 app.stats_bytes_sent = 0;
+                app.stats_frames_sent = 0;
+                app.stats_frames_received = 0;
             }
         }
 
